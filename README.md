@@ -1,7 +1,7 @@
 # candle-fused-attn
 
 A fused **fp32** scaled-dot-product attention for [candle](https://github.com/huggingface/candle),
-**forward and backward**, as a `CustomOp3` over stock candle 0.11.
+**forward and backward**, as custom ops (`CustomOp1`, `CustomOp3`) over stock candle 0.11.
 
 ```rust
 // The fast path: straight from a fused qkv projection [batch, seq, 3·heads·64] to the merged
@@ -29,7 +29,7 @@ is f16/bf16 and forward-only). Prior art: kaio-candle 0.2.0 (fp32 fwd+bwd, singl
 ## Status (v0.1, 2026-10-02)
 
 head_dim 64 on CUDA; non-causal and causal; no dropout. Parity against candle's composed attention
-(autograd): within 1–3× the composed path's own CPU-vs-CUDA spread (≤ 2e-6), forward and all
+(autograd): within 1–2× the composed path's own CPU-vs-CUDA spread (≤ 3.4e-6), forward and all
 three gradients. RTX 5060 Ti, b 64 · h 6 · s 240 · d 64, one layer, forward + backward (wall, patched candle):
 `fused_attention_qkv` 7.0 ms, `fused_attention` 13.0 ms, composed 42.1 ms. Kernels (nsys):
 forward 1.37 ms; backward 0.09 + 2.18 + 1.79 ms.
