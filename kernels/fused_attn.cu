@@ -14,8 +14,9 @@
 //     that each recompute P, so every sum has a fixed order and reruns are bit-identical.
 //
 // Layouts. q, k, v are read through (batch, head, seq) strides with head_dim contiguous, so the
-// views of a fused qkv projection need no copy. O, dQ, dK, dV are written physically
-// [b, s, h, d] (the merge-heads layout); L and D are [b, h, s].
+// views of a fused qkv projection need no copy. O is written [b, s, h, d] (the merge-heads
+// layout); dQ, dK, dV are written INTERLEAVED into one [b, s, 3, h, d] buffer, the layout of the
+// fused qkv projection's gradient; L and D are [b, h, s].
 //
 // Every kernel but the small D one is register micro-tiled (each thread a 2x4 or 4x4 block of
 // outputs, shared memory read as float4) over DYNAMIC shared memory, 61-70 KB per block: past
@@ -84,7 +85,7 @@ __device__ __forceinline__ void load_tile4(float* dst, const float* __restrict__
 extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dkdv_f32_d64(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ d_o, const float* __restrict__ lse, const float* __restrict__ dsum,
-    float* __restrict__ dk, float* __restrict__ dv,
+    float* __restrict__ dqkv,
     int B, int H, int S, float scale, int causal,
     int64_t q_sb, int64_t q_sh, int64_t q_ss,
     int64_t k_sb, int64_t k_sh, int64_t k_ss,
@@ -178,10 +179,10 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dkdv_f32_d64(
   for (int a = 0; a < 4; ++a) {
     const int j = k0 + j0 + a;
     if (j >= S) continue;
-    const int64_t off = (((int64_t)b * S + j) * H + h) * HD + d0;
-    *reinterpret_cast<float4*>(dk + off) =
+    const int64_t off = ((int64_t)b * S + j) * (3 * H * HD) + h * HD + d0;
+    *reinterpret_cast<float4*>(dqkv + H * HD + off) =
         make_float4(adk[a][0] * scale, adk[a][1] * scale, adk[a][2] * scale, adk[a][3] * scale);
-    *reinterpret_cast<float4*>(dv + off) = make_float4(adv[a][0], adv[a][1], adv[a][2], adv[a][3]);
+    *reinterpret_cast<float4*>(dqkv + 2 * H * HD + off) = make_float4(adv[a][0], adv[a][1], adv[a][2], adv[a][3]);
   }
 }
 
@@ -194,7 +195,7 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dkdv_f32_d64(
 extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dq_f32_d64(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ d_o, const float* __restrict__ lse, const float* __restrict__ dsum,
-    float* __restrict__ dq,
+    float* __restrict__ dqkv,
     int B, int H, int S, float scale, int causal,
     int64_t q_sb, int64_t q_sh, int64_t q_ss,
     int64_t k_sb, int64_t k_sh, int64_t k_ss,
@@ -285,8 +286,8 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dq_f32_d64(
   for (int a = 0; a < 4; ++a) {
     const int i = q0 + i0 + a;
     if (i >= S) continue;
-    const int64_t off = (((int64_t)b * S + i) * H + h) * HD + d0;
-    *reinterpret_cast<float4*>(dq + off) =
+    const int64_t off = ((int64_t)b * S + i) * (3 * H * HD) + h * HD + d0;
+    *reinterpret_cast<float4*>(dqkv + off) =
         make_float4(adq[a][0] * scale, adq[a][1] * scale, adq[a][2] * scale, adq[a][3] * scale);
   }
 }
@@ -298,8 +299,7 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dq_f32_d64(
 //            reduced over the 16 lanes sharing ty; P goes to shared memory.
 //   phase 2: the SAME thread owns rows 4ty .. +4 and dims 4tx .. +4 of the O accumulator, so the
 //            rescale by exp(m_old - m_new) and the final 1/l never cross threads.
-// Out: ONE packed buffer, o [b, s, h, d] followed by lse [b, h, s] (the backward's saved state
-// travels as the op's single output; see lib.rs).
+// Out: o [b, s, h, d] (the merge-heads layout) and lse [b, h, s], the backward's saved state.
 // ------------------------------------------------------------------------------------------------
 #define FW_QRYS 64
 #define FW_KEYS 64
@@ -320,7 +320,7 @@ __device__ __forceinline__ float row_sum16(float x) {
 
 extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-    float* __restrict__ out,
+    float* __restrict__ o, float* __restrict__ lse,
     int B, int H, int S, float scale, int causal,
     int64_t q_sb, int64_t q_sh, int64_t q_ss,
     int64_t k_sb, int64_t k_sh, int64_t k_ss,
@@ -424,13 +424,12 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
     }
   }
 
-  float* lse = out + (int64_t)B * S * H * HD;
 #pragma unroll
   for (int r = 0; r < 4; ++r) {
     const int i = q0 + r0 + r;
     if (i >= S) continue;
     const float inv = 1.0f / l[r];
-    *reinterpret_cast<float4*>(out + (((int64_t)b * S + i) * H + h) * HD + d0) =
+    *reinterpret_cast<float4*>(o + (((int64_t)b * S + i) * H + h) * HD + d0) =
         make_float4(acc[r][0] * inv, acc[r][1] * inv, acc[r][2] * inv, acc[r][3] * inv);
     if (tx == 0) lse[((int64_t)b * H + h) * S + i] = m[r] + logf(l[r]);
   }

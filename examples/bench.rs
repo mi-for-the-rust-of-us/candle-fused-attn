@@ -9,7 +9,7 @@
 //! Usage: `cargo run --release --features cuda --example bench [b h s]`
 
 use candle_core::{D, Device, Tensor, Var};
-use candle_fused_attn::fused_attention;
+use candle_fused_attn::{fused_attention, fused_attention_qkv};
 use std::time::Instant;
 
 fn composed(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Tensor {
@@ -54,12 +54,18 @@ fn main() {
     let merge = |o: Tensor| o.transpose(1, 2).unwrap().reshape((b, s, h * d)).unwrap();
 
     let fused = || merge(fused_attention(&q, &k, &v, scale as f32, false).unwrap());
+    let fused_qkv = || fused_attention_qkv(qkv.as_tensor(), h, scale as f32, false).unwrap();
     let comp = || merge(composed(&q, &k, &v, scale));
     println!("b {b}  h {h}  s {s}  d {d}  (ms per call, median of 20 after 5 warm-up)");
     for (name, f) in [
         ("fused", &fused as &dyn Fn() -> Tensor),
+        ("fused_qkv", &fused_qkv),
         ("composed", &comp),
     ] {
+        // FA_ONLY=fused (or composed) restricts the run, for a clean nsys trace of one path.
+        if std::env::var("FA_ONLY").is_ok_and(|o| o != name) {
+            continue;
+        }
         let time = |work: &dyn Fn()| {
             let mut t: Vec<f64> = (0..25)
                 .map(|_| {
@@ -78,7 +84,13 @@ fn main() {
             f();
         });
         let both = time(&|| {
-            f().sum_all().unwrap().backward().unwrap();
+            // Two-step reduction: candle's one-shot sum_all over 6 M floats alone costs ~4 ms.
+            f().sum_keepdim(2)
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .backward()
+                .unwrap();
         });
         println!("{name:>9}: forward {fwd:7.3}   forward+backward {both:7.3}");
     }
