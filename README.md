@@ -1,5 +1,8 @@
 # candle-fused-attn
 
+> **ἐξ ἐλαχίστου πλεῖστον** · *ex elakhístou pleîston* · from the least, the most<br>
+> **ἐξ ὀλίγων πολλά** · *ex olígōn pollá* · from few things, many
+
 A fused **fp32** scaled-dot-product attention for [candle](https://github.com/huggingface/candle),
 **forward and backward**, as custom ops (`CustomOp1`, `CustomOp3`) over stock candle 0.11.
 
