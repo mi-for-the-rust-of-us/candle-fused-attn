@@ -16,7 +16,6 @@ documentation = "https://docs.rs/candle-fused-attn"
 readme = "README.md"
 # The benchmark's outputs and local Python caches are not part of the crate.
 exclude = ["target/", "bench/__pycache__/", ".github/"]
-publish = false  # flipped by hand at the first release, on Eric's go
 
 [dependencies]
 candle-core = "0.11"
