@@ -143,6 +143,7 @@ at your option.
   designed to improve AI coding accuracy — with Grit-FA rules for the CUDA kernels (cited C++
   references, constants twinned across Rust and CUDA, a stated summation order for every reduction)
   and for published claims.
+- Plans: [ROADMAP.md](ROADMAP.md) (next: a faster forward); how a release is cut: [CLAUDE.md](CLAUDE.md).
 - CI runs the CPU path on the MSRV (1.88) and stable, rustdoc with private items and cargo-deny.
   The CUDA tests need a GPU and run locally before each release. Releases are published from
   GitHub Actions through crates.io Trusted Publishing, after the maintainer's approval.
