@@ -22,23 +22,27 @@
 // fused qkv projection's gradient; L and D are [b, h, s].
 //
 // Every kernel but the small D one is register micro-tiled (each thread a 2x4 or 4x4 block of
-// outputs, shared memory read as float4) over DYNAMIC shared memory, 68-70 KB per block: past
-// candle's 48 KB static limit, so the launcher sets the attribute through cudarc. 256 threads.
+// outputs, shared memory read as float4) over DYNAMIC shared memory, 68 KB (69,632 B) per block:
+// past candle's 48 KB static limit, so the launcher sets the attribute through cudarc. 256 threads.
 
 #include <math.h>
 #include <stdint.h>
 
-#define HD 64          // head_dim
-#define NT 256         // threads per block
-#define KB_KEYS 64     // backward: keys per block (one key block)
-#define KB_QRYS 32     // backward: queries per tile (one dQ turn counter each)
+#define HD 64          // head_dim; TWIN: src/lib.rs:CUDA_HEAD_DIM
+#define NT 256         // threads per block; TWIN: src/cuda.rs:THREADS
+#define KB_KEYS 64     // backward: keys per block (one key block); TWIN: src/cuda.rs:BWD_KEYS
+#define KB_QRYS 32     // backward: queries per tile (one dQ turn counter each);
+                       // TWIN: src/cuda.rs:QUERY_TILE
 
 // ------------------------------------------------------------------------------------------------
 // Backward, step 1: D[b, h, i] = sum_c dO[b, i, h, c] * O[b, i, h, c]. One warp per row. It also
 // zeroes the dQ turn counters of step 2 ([b, h, ceil(S / KB_QRYS)], one per query tile), which
 // saves a memset launch: the stream orders it before step 2.
+// REFERENCE: the `dot_do_o` step of FlashAttention-2's backward (`run_flash_bwd_seqk_parallel`,
+// Dao-AILab upstream) -- D = rowsum(dO o O), one row per warp; departs by also zeroing the turns.
+// Shared memory: none; NT / 32 rows per block (TWIN: src/cuda.rs:WARPS derives it from NT).
 // ------------------------------------------------------------------------------------------------
-extern "C" __global__ void fattn_bwd_dot_f32_d64(
+extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dot_f32_d64(
     const float* __restrict__ o, const float* __restrict__ d_o, float* __restrict__ dsum,
     int* __restrict__ turn,
     int B, int H, int S, int64_t do_sb, int64_t do_sh, int64_t do_ss) {
@@ -49,10 +53,13 @@ extern "C" __global__ void fattn_bwd_dot_f32_d64(
   const float* op = o + (((int64_t)b * S + i) * H + h) * HD;
   const float* gp = d_o + b * do_sb + i * do_ss + h * do_sh;
   float x = op[lane] * gp[lane] + op[lane + 32] * gp[lane + 32];
+  // DETERMINISM: each lane its two products, then the xor butterfly 16, 8, 4, 2, 1: one fixed
+  // order, whatever the card or the schedule.
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) x += __shfl_xor_sync(0xffffffffu, x, off);
   if (lane == 0) dsum[row] = x;
-  if (lane == 0 && i % KB_QRYS == 0) turn[row / S * ((S + KB_QRYS - 1) / KB_QRYS) + i / KB_QRYS] = 0;
+  if (lane == 0 && i % KB_QRYS == 0)
+    turn[row / S * ((S + KB_QRYS - 1) / KB_QRYS) + i / KB_QRYS] = 0;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -61,9 +68,11 @@ extern "C" __global__ void fattn_bwd_dot_f32_d64(
 // for float4 reads, and 8 consecutive rows start on 8 distinct 4-bank groups, so a float4 read of
 // 8 rows by the 8 lanes of a phase is conflict-free.
 // ------------------------------------------------------------------------------------------------
-#define LD 68
+#define LD 68  // TWIN: src/cuda.rs:LD
 
-__device__ __forceinline__ float4 ld4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+__device__ __forceinline__ float4 ld4(const float* p) {
+  return *reinterpret_cast<const float4*>(p);
+}
 
 __device__ __forceinline__ float dot4(float4 a, float4 b, float acc) {
   acc = fmaf(a.x, b.x, acc);
@@ -86,11 +95,15 @@ __device__ __forceinline__ void load_tile4(float* dst, const float* __restrict__
 }
 
 // The dQ turn of one query tile: wait until `kb` key blocks have added theirs (thread 0 spins,
-// acquire at GPU scope), then pass it on (release). PyTorch's `AtomicLock` (`kernel_backward.h`)
-// is the pattern, with one change: the turn goes in key-block order, not to whoever arrives.
+// acquire at GPU scope), then pass it on (release).
+// REFERENCE: `AtomicLock` in kernel_backward.h (PyTorch v2.10, mem_eff_attention) -- the
+// acquire/release handshake; departs on who goes next: the turn goes in key-block order, not to
+// whoever arrives (the ordered semaphore of CUTLASS's serial split-K).
 __device__ __forceinline__ void wait_turn(const int* p, int kb) {
   int seen;
   for (;;) {
+    // ORDER: acquire at GPU scope; pairs with pass_turn's release by key block kb - 1, so that
+    // block's dQ stores are visible to this thread once it reads kb.
     asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(seen) : "l"(p) : "memory");
     if (seen == kb) break;
     __nanosleep(32);
@@ -98,6 +111,8 @@ __device__ __forceinline__ void wait_turn(const int* p, int kb) {
 }
 
 __device__ __forceinline__ void pass_turn(int* p, int next) {
+  // ORDER: release at GPU scope; publishes this block's dQ stores (made visible by the caller's
+  // __threadfence) to key block `next`, whose wait_turn acquires them.
   asm volatile("st.release.gpu.global.b32 [%0], %1;" : : "l"(p), "r"(next) : "memory");
 }
 
@@ -112,6 +127,13 @@ __device__ __forceinline__ void pass_turn(int* p, int next) {
 //            ((p0 + p1) + p2) + ... in key-block order, whatever the scheduling.
 // No deadlock: a block waits only on LOWER key blocks of its own (b, h), which have lower linear
 // block indices and so were dispatched first (the assumption CUTLASS's serial split-K makes).
+// REFERENCE: flash_bwd_kernel.h (FlashAttention-2, Dao-AILab upstream) -- key blocks in parallel,
+// dK and dV in registers, P = exp(S - L) recomputed per query tile, dS = P o (dP - D); and
+// kernel_backward.h (PyTorch v2.10, mem_eff_attention) -- one pass per key block, S and dP computed
+// once. Departs from both on dQ: added in key-block ORDER (FA-2: fp32 atomicAdd; PyTorch: arrival
+// order under a lock), so the backward is deterministic.
+// Shared memory: dynamic, (2 KB_KEYS + 4 KB_QRYS) LD floats = 69,632 B (68 KB; TWIN:
+// src/cuda.rs:BWD_SMEM): one block per SM on the RTX 5060 Ti (measured).
 extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ d_o, const float* __restrict__ lse, const float* __restrict__ dsum,
@@ -191,6 +213,8 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     __syncthreads();
 
     // dV[j] += sum_i P[i][j] dO[i];  dK[j] += sum_i dS[i][j] Q[i]
+    // DETERMINISM: each dK, dV element is one thread's register, summed over query tiles and
+    // then queries in index order; no reduction across threads or blocks.
 #pragma unroll 4
     for (int i = 0; i < KB_QRYS; ++i) {
       const float4 p4 = ld4(Ps + i * LD + j0), s4 = ld4(dSs + i * LD + j0);
@@ -231,12 +255,16 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
 
     // This tile's contributors are key blocks 0 .. last (causal: those holding a key <= the
     // tile's last query); each adds on its turn.
+    // DETERMINISM: the tile's dQ is ((p0 + p1) + p2) + ... over key blocks in index order, then
+    // x scale by the last: a function of the shape alone, never of the card or the schedule.
     const int t = q0 / KB_QRYS;
     const int last = causal ? min((int)gridDim.x - 1, min(S - 1, q0 + KB_QRYS - 1) / KB_KEYS)
                             : (int)gridDim.x - 1;
     if (kb > 0) {
       if (tid == 0) {
         wait_turn(tp + t, kb);
+        // ORDER: with the __syncthreads below, extends thread 0's acquire to the whole block:
+        // every thread's __ldcg of dQ reads after key block kb - 1's stores.
         __threadfence();
       }
       __syncthreads();
@@ -245,7 +273,9 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     for (int r = 0; r < 2; ++r) {
       const int i = q0 + i0 + r;
       if (i >= S) continue;
-      float4* dst = reinterpret_cast<float4*>(dqkv + ((int64_t)b * S + i) * (3 * H * HD) + h * HD + d0);
+      // Through L2 (__ldcg / __stcg): L1 is not coherent across SMs.
+      float4* dst =
+          reinterpret_cast<float4*>(dqkv + ((int64_t)b * S + i) * (3 * H * HD) + h * HD + d0);
       float4 acc = make_float4(pq[r][0], pq[r][1], pq[r][2], pq[r][3]);
       if (kb > 0) {
         const float4 prev = __ldcg(dst);
@@ -255,7 +285,9 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
       __stcg(dst, acc);
     }
     if (kb < last) {
-      __threadfence();  // every thread's dQ stores visible GPU-wide before the turn passes
+      // ORDER: every thread's dQ stores visible GPU-wide before thread 0 releases the turn to
+      // key block kb + 1 (pass_turn).
+      __threadfence();
       __syncthreads();
       if (tid == 0) pass_turn(tp + t, kb + 1);
     }
@@ -268,7 +300,8 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     const int64_t off = ((int64_t)b * S + j) * (3 * H * HD) + h * HD + d0;
     *reinterpret_cast<float4*>(dqkv + H * HD + off) =
         make_float4(adk[a][0] * scale, adk[a][1] * scale, adk[a][2] * scale, adk[a][3] * scale);
-    *reinterpret_cast<float4*>(dqkv + 2 * H * HD + off) = make_float4(adv[a][0], adv[a][1], adv[a][2], adv[a][3]);
+    *reinterpret_cast<float4*>(dqkv + 2 * H * HD + off) =
+        make_float4(adv[a][0], adv[a][1], adv[a][2], adv[a][3]);
   }
 }
 
@@ -280,9 +313,17 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
 //   phase 2: the SAME thread owns rows 4ty .. +4 and dims 4tx .. +4 of the O accumulator, so the
 //            rescale by exp(m_old - m_new) and the final 1/l never cross threads.
 // Out: o [b, s, h, d] (the merge-heads layout) and lse [b, h, s], the backward's saved state.
+// REFERENCE: flash_fwd_kernel.h (FlashAttention-2, as vendored in candle-flash-attn) -- key tiles
+// walked with an online softmax, only O and L written; departs on the arithmetic: fp32 FFMA on
+// CUDA cores, no tensor cores (FA-2 is f16/bf16 only).
+// Shared memory: dynamic, (2 FW_QRYS + 2 FW_KEYS) LD floats = 69,632 B (68 KB; TWIN:
+// src/cuda.rs:FWD_SMEM): one block per SM on the RTX 5060 Ti (measured).
 // ------------------------------------------------------------------------------------------------
-#define FW_QRYS 64
-#define FW_KEYS 64
+#define FW_QRYS 64  // TWIN: src/cuda.rs:FWD_QUERIES
+#define FW_KEYS 64  // TWIN: src/cuda.rs:FWD_KEYS
+
+// DETERMINISM (row_max16, row_sum16): the xor butterfly 1, 2, 4, 8 over the 16 lanes of a row;
+// the max is order-free and the sum's order is fixed.
 
 __device__ __forceinline__ float row_max16(float x) {
   x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 1));
@@ -375,6 +416,7 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
         Ps[(r0 + r) * LD + tx + 16 * jj] = p;
         psum += p;
       }
+      // DETERMINISM: l and acc accumulate over key tiles in index order, one thread per element.
       l[r] = l[r] * alpha + row_sum16(psum);
       m[r] = m_new;
 #pragma unroll

@@ -29,18 +29,31 @@ mod ptx {
 }
 
 /// Threads per block, as `NT` in the kernels.
-const THREADS: u32 = 256;
-/// Warps per block (one `D` row each in the dot kernel).
-const WARPS: usize = 8;
-/// Query rows per forward block, keys per backward block.
-const ROWS: usize = 64;
+const THREADS: u32 = 256; // TWIN: kernels/fused_attn.cu:NT
+/// Warps per block (one `D` row each in the dot kernel), `NT / 32` in the kernels.
+// CAST: u32 → usize, 256 / 32 = 8 fits any usize
+#[allow(clippy::as_conversions)]
+const WARPS: usize = (THREADS / 32) as usize;
+/// Query rows per forward block, as `FW_QRYS` in the kernels.
+const FWD_QUERIES: usize = 64; // TWIN: kernels/fused_attn.cu:FW_QRYS
+/// Keys per forward tile, as `FW_KEYS` in the kernels.
+const FWD_KEYS: usize = 64; // TWIN: kernels/fused_attn.cu:FW_KEYS
+/// Keys per backward block (one key block), as `KB_KEYS` in the kernels.
+const BWD_KEYS: usize = 64; // TWIN: kernels/fused_attn.cu:KB_KEYS
 /// Queries per backward tile: one dQ turn counter each, as `KB_QRYS` in the kernels.
-const QUERY_TILE: usize = 32;
-/// Dynamic shared memory of the forward: Q, K, V, P (64 rows each) × 68 floats.
-const FWD_SMEM: u32 = 4 * 64 * 68 * 4;
-/// Dynamic shared memory of the backward kernel: K, V (64 rows), Q, dO, P, dS (32 rows), × 68
-/// floats.
-const BWD_SMEM: u32 = (2 * 64 + 4 * 32) * 68 * 4;
+const QUERY_TILE: usize = 32; // TWIN: kernels/fused_attn.cu:KB_QRYS
+/// The padded row stride of every shared-memory tile, in floats (`head_dim` + 4), as `LD`.
+const LD: usize = 68; // TWIN: kernels/fused_attn.cu:LD
+/// Dynamic shared memory of the forward, in bytes: Q and P ([`FWD_QUERIES`] rows), K and V
+/// ([`FWD_KEYS`] rows), [`LD`] floats each: 69,632 bytes.
+// CAST: usize → u32, 69,632 bytes
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+const FWD_SMEM: u32 = ((2 * FWD_QUERIES + 2 * FWD_KEYS) * LD * size_of::<f32>()) as u32;
+/// Dynamic shared memory of the backward kernel, in bytes: K and V ([`BWD_KEYS`] rows), Q, dO, P
+/// and dS ([`QUERY_TILE`] rows), [`LD`] floats each: 69,632 bytes.
+// CAST: usize → u32, 69,632 bytes
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+const BWD_SMEM: u32 = ((2 * BWD_KEYS + 4 * QUERY_TILE) * LD * size_of::<f32>()) as u32;
 
 /// A `[b, h, s, d]` operand on the device: its first element and its (batch, head, seq) strides
 /// in floats (`d` contiguous).
@@ -77,10 +90,11 @@ fn check_head_dim(d: usize) -> Result<()> {
     }
 }
 
-/// A grid of `ceil(s / ROWS) × h × b` blocks of [`THREADS`] with `smem` bytes of shared memory.
-fn grid((b, h, s, _): Dims, smem: u32) -> Result<LaunchConfig> {
+/// A grid of `ceil(s / rows) × h × b` blocks of [`THREADS`] with `smem` bytes of shared memory,
+/// `rows` the sequence positions one block owns.
+fn grid((b, h, s, _): Dims, rows: usize, smem: u32) -> Result<LaunchConfig> {
     Ok(LaunchConfig {
-        grid_dim: (u32_of(s.div_ceil(ROWS))?, u32_of(h)?, u32_of(b)?),
+        grid_dim: (u32_of(s.div_ceil(rows))?, u32_of(h)?, u32_of(b)?),
         block_dim: (THREADS, 1, 1),
         shared_mem_bytes: smem,
     })
@@ -164,7 +178,7 @@ pub fn forward(
         .arg(&v2);
     // SAFETY: reads q, k, v through their strides inside their storages (shape-checked by the
     // caller), writes all of `o` and `lse`.
-    unsafe { builder.launch(grid(dims, FWD_SMEM)?) }.w()?;
+    unsafe { builder.launch(grid(dims, FWD_QUERIES, FWD_SMEM)?) }.w()?;
     Ok((o, lse))
 }
 
@@ -239,7 +253,7 @@ pub fn backward(
     // SAFETY: reads q, k, v, dO through their (float4-aligned) strides, L and D; writes all of
     // dqkv (dK, dV by the owning key block; dQ by key block 0, then read-modify-written in
     // key-block order under the turn counters, which it also advances).
-    unsafe { builder.launch(grid(dims, BWD_SMEM)?) }.w()?;
+    unsafe { builder.launch(grid(dims, BWD_KEYS, BWD_SMEM)?) }.w()?;
     Ok(dqkv)
 }
 

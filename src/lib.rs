@@ -56,6 +56,10 @@
 //! mask beyond `causal`. The backward's dQ turn counters use `ld.acquire` / `st.release` at GPU
 //! scope, so the CUDA path needs compute capability 7.0 (Volta) or newer.
 
+#![deny(warnings)]
+// The MSRV lint guard: `deny(warnings)` implies `deny(unknown_lints)`, and the MSRV toolchain's
+// clippy may not know a lint that a later `#[allow]` names (CONVENTIONS.md, "MSRV Lint Guard").
+#![allow(unknown_lints)]
 // EXPLICIT: `b, h, s, d` (batch, heads, seq, head_dim) and `q, k, v, o, l` are the notation of the
 // attention papers this code follows; longer names would hide the math.
 #![allow(clippy::many_single_char_names)]
@@ -70,7 +74,7 @@ use candle_core::{
 mod cuda;
 
 /// The head dimension the CUDA kernels are specialised for.
-pub const CUDA_HEAD_DIM: usize = 64;
+pub const CUDA_HEAD_DIM: usize = 64; // TWIN: kernels/fused_attn.cu:HD
 
 /// `(batch, heads, seq, head_dim)`.
 pub(crate) type Dims = (usize, usize, usize, usize);
@@ -511,7 +515,8 @@ impl CustomOp1 for FusedAttentionQkv {
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         use candle_core::backend::BackendStorage;
         let (dims, strides, [oq, ok, ov]) = qkv_geometry(layout, self.heads)?;
-        if layout.start_offset() % 4 != 0 || strides.iter().any(|s| s % 4 != 0) {
+        if !layout.start_offset().is_multiple_of(4) || strides.iter().any(|s| !s.is_multiple_of(4))
+        {
             return Err(Error::Msg(
                 "fused_attention_qkv: rows must be 16-byte aligned".into(),
             ));
@@ -529,7 +534,8 @@ impl CustomOp1 for FusedAttentionQkv {
         ))
     }
 
-    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] // the offsets serve CUDA only
+    // EXPLICIT: the q / k / v offsets serve the CUDA path only.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     fn bwd(&self, qkv: &Tensor, res: &Tensor, grad_res: &Tensor) -> Result<Option<Tensor>> {
         if qkv.dtype() != DType::F32 {
             return Err(Error::Msg("fused_attention_qkv: f32 only".into()));

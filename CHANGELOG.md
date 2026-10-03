@@ -37,7 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public functions.
 - `CONVENTIONS.md` (Grit + Grit-FA): the organisation's conventions, plus rules for CUDA kernels,
   the determinism contract and published claims; `bench/results/`, the reports behind the README's
-  numbers.
+  numbers. Applied to the code: `#![deny(warnings)]` with the MSRV lint guard, `REFERENCE` /
+  `ORDER` / `DETERMINISM` annotations in the kernels, `__launch_bounds__` on every kernel,
+  shared-memory sizes derived from `TWIN` tile constants, and the determinism tests comparing
+  `to_bits()`.
 - CI (CPU path, MSRV 1.88 and stable; rustdoc with private items; cargo-deny) and a Trusted
   Publishing release workflow.
 

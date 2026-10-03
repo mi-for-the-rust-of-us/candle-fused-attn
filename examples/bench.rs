@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 // EXPLICIT: a benchmark — a panic costs nothing but a re-run.
+#![allow(
+    clippy::many_single_char_names,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
+// EXPLICIT: `b, h, s, d` and `q, k, v` are the attention papers' notation, as in the library;
+// the casts turn shape sizes and an f64 scale into the f32 the kernels take, at magnitudes far
+// inside both types' exact ranges.
 
 //! Wall time of the fused attention, forward and forward + backward, at one shape (default the
 //! canvas trainer's: b 64, h 6, s 240, d 64), against the composed attention of the same math
@@ -12,6 +21,7 @@ use candle_core::{D, Device, Tensor, Var};
 use candle_fused_attn::{fused_attention, fused_attention_qkv};
 use std::time::Instant;
 
+/// The reference: `softmax(q·kᵀ·scale)·v` from elementary candle ops, differentiated by autograd.
 fn composed(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Tensor {
     let scores = (q
         .contiguous()

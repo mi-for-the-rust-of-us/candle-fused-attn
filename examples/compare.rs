@@ -211,14 +211,14 @@ fn main() {
                     let (x, y) = (x.to_vec1::<f32>().unwrap(), y.to_vec1::<f32>().unwrap());
                     x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits())
                 };
-                let det = same(&o1, &o2) && same(&g1, &g2);
+                let deterministic = same(&o1, &o2) && same(&g1, &g2);
                 let file = a.out.join(format!("{name}.safetensors"));
                 let map = HashMap::from([("o".to_owned(), o1), ("dqkv".to_owned(), g1)]);
                 candle_core::safetensors::save(&map, &file).unwrap();
                 let sep = if i == 0 { "" } else { ", " };
                 write!(
                     json,
-                    "{sep}{{\"name\": \"{name}\", \"deterministic\": {det}}}"
+                    "{sep}{{\"name\": \"{name}\", \"deterministic\": {deterministic}}}"
                 )
                 .unwrap();
             }

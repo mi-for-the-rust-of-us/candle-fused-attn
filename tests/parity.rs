@@ -6,6 +6,15 @@
     clippy::indexing_slicing
 )]
 // EXPLICIT: tests — a panic is the failure report.
+#![allow(
+    clippy::many_single_char_names,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
+// EXPLICIT: `b, h, s, d` and `q, k, v` are the attention papers' notation, as in the library;
+// the casts turn shape sizes and an f64 scale into the f32 the kernels take, at magnitudes far
+// inside both types' exact ranges.
 
 //! Both entry points against an INDEPENDENT composed attention (`softmax(q·kᵀ·s)·v` from candle
 //! ops, differentiated by candle's autograd): forward values and the gradient of the fused qkv
@@ -76,6 +85,16 @@ fn attend(path: Path, qkv: &Tensor, h: usize, d: usize, causal: bool) -> Tensor 
         Path::Fused => merge(fused_attention(&q, &k, &v, scale as f32, causal).unwrap()),
         Path::FusedQkv => fused_attention_qkv(qkv, h, scale as f32, causal).unwrap(),
     }
+}
+
+/// Every element's bit pattern, moved to the CPU: determinism is `to_bits()` equality.
+fn bits(t: &Tensor) -> Vec<u32> {
+    let t = t.to_device(&Device::Cpu).unwrap().flatten_all().unwrap();
+    t.to_vec1::<f32>()
+        .unwrap()
+        .into_iter()
+        .map(f32::to_bits)
+        .collect()
 }
 
 /// Max |a − b| over all elements, both moved to the CPU.
@@ -181,7 +200,7 @@ fn backward_twice_over_one_graph() {
         .get(qkv.as_tensor())
         .unwrap()
         .clone();
-    assert_eq!(max_abs(&g1, &g2), 0.0);
+    assert_eq!(bits(&g1), bits(&g2));
 }
 
 #[cfg(feature = "cuda")]
@@ -213,9 +232,8 @@ mod cuda {
                 let (_, g1) = run(path, &qkv, &w, 6, 64, causal);
                 for rerun in 0..8 {
                     let (_, g2) = run(path, &qkv, &w, 6, 64, causal);
-                    assert_eq!(
-                        max_abs(&g1, &g2),
-                        0.0,
+                    assert!(
+                        bits(&g1) == bits(&g2),
                         "{path:?}, causal {causal}: rerun {rerun} differs from the first"
                     );
                 }
