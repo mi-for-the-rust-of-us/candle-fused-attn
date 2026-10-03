@@ -76,6 +76,20 @@ if [ "$drift" -ne 0 ]; then
   exit 1
 fi
 
+# The runners execute `scripts/*.sh` by their GIT mode; Git Bash on Windows runs any file with a
+# shebang, so a script committed 100644 passes here and fails there ("Permission denied": the
+# v0.2.0-rc.1 rehearsal's `verify`). Check the mode git records.
+mode_bad=0
+while read -r mode _ _ path; do
+  if [ "$mode" != "100755" ]; then
+    echo "NOT EXECUTABLE in git: $path (fix: git update-index --chmod=+x $path)" >&2
+    mode_bad=1
+  fi
+done < <(git ls-files -s 'scripts/*.sh')
+if [ "$mode_bad" -ne 0 ]; then
+  exit 1
+fi
+
 # ---- 2. The environment the workflows assume -------------------------------------------------
 # On Windows `python3` is often the Microsoft Store stub: fall back to `python`.
 if ! python3 --version > /dev/null 2>&1; then
