@@ -22,6 +22,11 @@ default = []
 # builds and its gradient tests run on a machine with no CUDA toolkit.
 cuda = ["candle-core/cuda", "dep:cudaforge"]
 
+# The candle half of `bench/compare.py`; it brackets nsys captures through candle's cudarc.
+[[example]]
+name = "compare"
+required-features = ["cuda"]
+
 [lints.rust]
 elided_lifetimes_in_paths = "deny"
 missing_docs              = "warn"
