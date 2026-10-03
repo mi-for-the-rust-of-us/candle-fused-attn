@@ -42,7 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared-memory sizes derived from `TWIN` tile constants, and the determinism tests comparing
   `to_bits()`.
 - CI (CPU path, MSRV 1.88 and stable; rustdoc with private items; cargo-deny) and a Trusted
-  Publishing release workflow.
+  Publishing release workflow. Its `verify` job checks that the tag names `Cargo.toml`'s version
+  and that `CHANGELOG.md` has its section; a manual run is a dry run by default (the Trusted
+  Publishing token exchange, then `cargo publish --dry-run`; no upload, no GitHub Release).
+- `scripts/ci-local.sh`: both workflows' commands run locally before pushing, verbatim, on 1.88 and
+  stable, plus what GitHub's runners cannot run (clippy and the tests with `--features cuda`, and
+  `cargo publish --dry-run`). It refuses to run if a workflow has a command it does not.
 
 ## [0.1.0] - 2026-10-02
 

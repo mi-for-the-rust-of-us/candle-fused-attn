@@ -105,6 +105,7 @@ use it. Its code is [`examples/tutorial.rs`](examples/tutorial.rs), which CI run
 ```bash
 cargo test                     # the CPU path: no GPU, no CUDA toolkit
 cargo test --features cuda     # the kernels: CUDA vs CPU within the measured band, bitwise reruns
+bash scripts/ci-local.sh       # before pushing: CI and the release's checks, locally (--no-cuda to skip the GPU)
 ```
 
 The `cuda` feature compiles the kernels with `nvcc` at build time (the CUDA toolkit must be

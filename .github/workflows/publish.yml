@@ -7,7 +7,18 @@ on:
     tags:
       - "v*"
       - "!v*-*"
+  # A manual run is a REHEARSAL unless `dry_run` is unchecked. Start it from a hyphenated tag
+  # (`v0.2.0-rc.1`: pushing one triggers nothing, and it matches the `release` environment's `v*`):
+  # `verify` runs in full; `publish` waits for approval, exchanges the Trusted Publishing token (so
+  # crates.io checks this repository, this workflow file and the environment), then runs
+  # `cargo publish --dry-run`; no GitHub Release is created. The auth action's `post` step revokes
+  # the unused token when the job ends.
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: everything but the upload and the GitHub Release"
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,9 +50,19 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
 
-      # A tag whose `## [Unreleased]` was never renamed fails here, BEFORE anything is published.
-      - name: Check this version's CHANGELOG section
-        run: scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > /dev/null
+      # The tag must name Cargo.toml's version (never tag before bumping), and CHANGELOG.md must
+      # have that version's section: a tag whose `## [Unreleased]` was never renamed fails here,
+      # BEFORE anything is published. A dry run, started from an rc tag, checks the section only.
+      - name: Check the tag, the version and its CHANGELOG section
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "${DRY_RUN:-}" != "true" ] && [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not name the version in Cargo.toml, ${version}" >&2
+            exit 1
+          fi
+          scripts/release-notes.sh "$version" > /dev/null
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
 
       - name: Check formatting
         run: cargo fmt --check
@@ -91,13 +112,21 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Publish to crates.io
+        if: ${{ inputs.dry_run != true }}
         run: cargo publish --locked --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+      # The rehearsal: the token exchange above already proved the Trusted Publishing setup; this
+      # uploads nothing and needs no token.
+      - name: Publish to crates.io (dry run)
+        if: ${{ inputs.dry_run == true }}
+        run: cargo publish --locked --no-verify --dry-run
+
   release:
     name: GitHub Release
     needs: publish
+    if: ${{ inputs.dry_run != true }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
