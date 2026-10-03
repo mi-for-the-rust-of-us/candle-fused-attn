@@ -201,14 +201,25 @@ mod cuda {
         }
     }
 
+    /// dQ is summed across key blocks under turn counters, so scheduling decides WHEN each block
+    /// adds, never in which ORDER: every rerun must be bit-identical. Several reruns, causal and
+    /// not, since an order bug would show only on some schedules.
     #[test]
     fn cuda_backward_is_deterministic() {
         let Ok(dev) = Device::new_cuda(0) else { return };
         let (qkv, w) = inputs(4, 240, 6, 64, &dev);
-        for path in [Path::Fused, Path::FusedQkv] {
-            let (_, g1) = run(path, &qkv, &w, 6, 64, false);
-            let (_, g2) = run(path, &qkv, &w, 6, 64, false);
-            assert_eq!(max_abs(&g1, &g2), 0.0, "{path:?}: two backward runs differ");
+        for causal in [false, true] {
+            for path in [Path::Fused, Path::FusedQkv] {
+                let (_, g1) = run(path, &qkv, &w, 6, 64, causal);
+                for rerun in 0..8 {
+                    let (_, g2) = run(path, &qkv, &w, 6, 64, causal);
+                    assert_eq!(
+                        max_abs(&g1, &g2),
+                        0.0,
+                        "{path:?}, causal {causal}: rerun {rerun} differs from the first"
+                    );
+                }
+            }
         }
     }
 }

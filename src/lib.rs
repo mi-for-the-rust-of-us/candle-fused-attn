@@ -11,7 +11,7 @@
 //!   `head_dim` contiguous).
 //!
 //! On CUDA: a FlashAttention-2-style forward (online softmax, the `[seq, seq]` scores never
-//! written) and a deterministic three-kernel backward. On CPU: the composed reference, so every
+//! written) and a deterministic two-kernel backward. On CPU: the composed reference, so every
 //! test runs anywhere. It works against STOCK candle: the PTX is loaded into candle's own context
 //! and launched on candle's own stream.
 //!

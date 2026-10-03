@@ -517,7 +517,10 @@ def render(rep: dict, names: list[str]) -> str:
            "## SDPA backends forced on these inputs (fwd + bwd)", ""]
   lines += [f"- `{k}`: {v}" for k, v in rep["backends"].items()]
   lines += ["", "## Accuracy against fp64 (normwise relative error; max-abs in brackets)", "",
-            "| candidate | o | dq | dk | dv | bitwise deterministic |", "|---|---|---|---|---|---|"]
+            "| candidate | o | dq | dk | dv | 2 runs bitwise equal |", "|---|---|---|---|---|---|"]
+  lines[-2:-2] = ["Two equal runs are an observation, not a guarantee: PyTorch's memory-efficient "
+                  "backward adds dQ across key splits in ARRIVAL order (`kernel_backward.h`, "
+                  "`AtomicLock`); ours adds them in key-block order.", ""]
   for name, s in rep["accuracy"].items():
     cells = [f"{s[p]['rel_fro']:.2e} [{s[p]['max_abs']:.1e}]" for p in PARTS]
     det = rep["deterministic"].get(name, "—")

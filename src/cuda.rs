@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! The CUDA launches: one forward kernel, three backward kernels (`kernels/fused_attn.cu`).
+//! The CUDA launches: one forward kernel, two backward kernels (`kernels/fused_attn.cu`).
 //!
 //! Everything runs on candle's own stream (and in its context), so ordering against candle's
 //! other kernels is the stream's and no synchronisation is needed. The module is loaded through
@@ -32,14 +32,15 @@ mod ptx {
 const THREADS: u32 = 256;
 /// Warps per block (one `D` row each in the dot kernel).
 const WARPS: usize = 8;
-/// Query rows per forward block, keys per dK/dV block, queries per dQ block.
+/// Query rows per forward block, keys per backward block.
 const ROWS: usize = 64;
+/// Queries per backward tile: one dQ turn counter each, as `KB_QRYS` in the kernels.
+const QUERY_TILE: usize = 32;
 /// Dynamic shared memory of the forward: Q, K, V, P (64 rows each) × 68 floats.
 const FWD_SMEM: u32 = 4 * 64 * 68 * 4;
-/// Dynamic shared memory of the dK/dV kernel: K, V (64 rows), Q, dO, P, dS (32 rows), × 68 floats.
-const DKDV_SMEM: u32 = (2 * 64 + 4 * 32) * 68 * 4;
-/// Dynamic shared memory of the dQ kernel: Q, dO (64 rows), K, V, dSᵀ (32 rows), × 68 floats.
-const DQ_SMEM: u32 = (2 * 64 + 3 * 32) * 68 * 4;
+/// Dynamic shared memory of the backward kernel: K, V (64 rows), Q, dO, P, dS (32 rows), × 68
+/// floats.
+const BWD_SMEM: u32 = (2 * 64 + 4 * 32) * 68 * 4;
 
 /// A `[b, h, s, d]` operand on the device: its first element and its (batch, head, seq) strides
 /// in floats (`d` contiguous).
@@ -168,8 +169,8 @@ pub fn forward(
 }
 
 /// The backward into ONE `[b, s, 3, h, d]` buffer (dQ, dK, dV interleaved: the layout of a fused
-/// qkv projection's gradient): `D = rowsum(dO ∘ O)`, then dK/dV over key blocks, then dQ over
-/// query blocks.
+/// qkv projection's gradient): `D = rowsum(dO ∘ O)` (which also zeroes the dQ turn counters),
+/// then one kernel over key blocks writing dK, dV and, in key-block order, dQ.
 pub fn backward(
     dev: &CudaDevice,
     (scale, causal): (f32, bool),
@@ -180,12 +181,14 @@ pub fn backward(
 ) -> Result<CudaSlice<f32>> {
     let (b, h, s, d) = dims;
     check_head_dim(d)?;
-    // SAFETY (both allocations): every element is written by the kernels below (one D per
-    // (b, h, i) row; each (b, s) row's dQ, dK, dV by the blocks owning that query / key).
-    let (mut dsum, mut dqkv) = unsafe {
+    // SAFETY (all three allocations): every element is written before it is read: one D per
+    // (b, h, i) row and one zeroed turn counter per (b, h, query tile), both by the dot kernel; each
+    // (b, s) row's dK, dV by the block owning that key, its dQ first by key block 0.
+    let (mut dsum, mut dqkv, mut turn) = unsafe {
         (
             dev.alloc::<f32>(b * h * s)?,
             dev.alloc::<f32>(3 * b * s * h * d)?,
+            dev.alloc::<i32>(b * h * s.div_ceil(QUERY_TILE))?,
         )
     };
     let (bi, hi, si, ci) = (i32_of(b)?, i32_of(h)?, i32_of(s)?, i32::from(causal));
@@ -195,7 +198,7 @@ pub fn backward(
 
     let func = function(dev, "fattn_bwd_dot_f32_d64", 0)?;
     let mut builder = stream.launch_builder(&func);
-    builder.arg(o).arg(&d_o.data).arg(&mut dsum);
+    builder.arg(o).arg(&d_o.data).arg(&mut dsum).arg(&mut turn);
     builder
         .arg(&bi)
         .arg(&hi)
@@ -208,39 +211,35 @@ pub fn backward(
         block_dim: (THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
-    // SAFETY: reads O and dO (b·s·h·d each, dO through its strides), writes all of dsum.
+    // SAFETY: reads O and dO (b·s·h·d each, dO through its strides), writes all of dsum and turn.
     unsafe { builder.launch(cfg) }.w()?;
 
-    for (name, smem) in [
-        ("fattn_bwd_dkdv_f32_d64", DKDV_SMEM),
-        ("fattn_bwd_dq_f32_d64", DQ_SMEM),
-    ] {
-        let func = function(dev, name, smem)?;
-        let mut builder = stream.launch_builder(&func);
-        builder
-            .arg(&q.data)
-            .arg(&k.data)
-            .arg(&v.data)
-            .arg(&d_o.data)
-            .arg(lse)
-            .arg(&dsum);
-        builder.arg(&mut dqkv);
-        builder.arg(&bi).arg(&hi).arg(&si).arg(&scale).arg(&ci);
-        builder
-            .arg(&q0)
-            .arg(&q1)
-            .arg(&q2)
-            .arg(&k0)
-            .arg(&k1)
-            .arg(&k2)
-            .arg(&v0)
-            .arg(&v1)
-            .arg(&v2);
-        builder.arg(&g0).arg(&g1).arg(&g2);
-        // SAFETY: reads q, k, v, dO through their (float4-aligned) strides, L and D; writes the
-        // dK and dV (resp. dQ) thirds of dqkv.
-        unsafe { builder.launch(grid(dims, smem)?) }.w()?;
-    }
+    let func = function(dev, "fattn_bwd_f32_d64", BWD_SMEM)?;
+    let mut builder = stream.launch_builder(&func);
+    builder
+        .arg(&q.data)
+        .arg(&k.data)
+        .arg(&v.data)
+        .arg(&d_o.data)
+        .arg(lse)
+        .arg(&dsum);
+    builder.arg(&mut dqkv).arg(&mut turn);
+    builder.arg(&bi).arg(&hi).arg(&si).arg(&scale).arg(&ci);
+    builder
+        .arg(&q0)
+        .arg(&q1)
+        .arg(&q2)
+        .arg(&k0)
+        .arg(&k1)
+        .arg(&k2)
+        .arg(&v0)
+        .arg(&v1)
+        .arg(&v2);
+    builder.arg(&g0).arg(&g1).arg(&g2);
+    // SAFETY: reads q, k, v, dO through their (float4-aligned) strides, L and D; writes all of
+    // dqkv (dK, dV by the owning key block; dQ by key block 0, then read-modify-written in
+    // key-block order under the turn counters, which it also advances).
+    unsafe { builder.launch(grid(dims, BWD_SMEM)?) }.w()?;
     Ok(dqkv)
 }
 

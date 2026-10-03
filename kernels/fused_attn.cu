@@ -9,9 +9,12 @@
 //   - fp32 end to end on CUDA cores (SIMT FFMA), no tensor cores: FA-2 is f16/bf16 only, and
 //     PyTorch's fp32 path (the memory-efficient kernels) uses 3xTF32. Plain FFMA keeps the
 //     arithmetic that of an fp32 matmul.
-//   - a DETERMINISTIC backward: FA-2 accumulates dQ with fp32 atomicAdd from every key block;
-//     here dK/dV (one block per key tile) and dQ (one block per query tile) are separate kernels
-//     that each recompute P, so every sum has a fixed order and reruns are bit-identical.
+//   - a DETERMINISTIC backward: FA-2 accumulates dQ with fp32 atomicAdd from every key block, and
+//     PyTorch's memory-efficient backward (`kernel_backward.h`, v2.10) adds the key splits' dQ
+//     under a spin lock in ARRIVAL order. Here the key blocks add their dQ partials in KEY-BLOCK
+//     order (a turn counter per query tile, the ordered semaphore of CUTLASS's serial split-K), so
+//     every sum has a fixed order and reruns are bit-identical; and S, dP are computed once per
+//     tile (5 matmuls), not recomputed by a separate dQ kernel (7).
 //
 // Layouts. q, k, v are read through (batch, head, seq) strides with head_dim contiguous, so the
 // views of a fused qkv projection need no copy. O is written [b, s, h, d] (the merge-heads
@@ -19,7 +22,7 @@
 // fused qkv projection's gradient; L and D are [b, h, s].
 //
 // Every kernel but the small D one is register micro-tiled (each thread a 2x4 or 4x4 block of
-// outputs, shared memory read as float4) over DYNAMIC shared memory, 61-70 KB per block: past
+// outputs, shared memory read as float4) over DYNAMIC shared memory, 68-70 KB per block: past
 // candle's 48 KB static limit, so the launcher sets the attribute through cudarc. 256 threads.
 
 #include <math.h>
@@ -27,12 +30,17 @@
 
 #define HD 64          // head_dim
 #define NT 256         // threads per block
+#define KB_KEYS 64     // backward: keys per block (one key block)
+#define KB_QRYS 32     // backward: queries per tile (one dQ turn counter each)
 
 // ------------------------------------------------------------------------------------------------
-// Backward, step 1: D[b, h, i] = sum_c dO[b, i, h, c] * O[b, i, h, c]. One warp per row.
+// Backward, step 1: D[b, h, i] = sum_c dO[b, i, h, c] * O[b, i, h, c]. One warp per row. It also
+// zeroes the dQ turn counters of step 2 ([b, h, ceil(S / KB_QRYS)], one per query tile), which
+// saves a memset launch: the stream orders it before step 2.
 // ------------------------------------------------------------------------------------------------
 extern "C" __global__ void fattn_bwd_dot_f32_d64(
     const float* __restrict__ o, const float* __restrict__ d_o, float* __restrict__ dsum,
+    int* __restrict__ turn,
     int B, int H, int S, int64_t do_sb, int64_t do_sh, int64_t do_ss) {
   const int row = blockIdx.x * (NT / 32) + threadIdx.x / 32;  // row = (b * H + h) * S + i
   const int lane = threadIdx.x % 32;
@@ -44,6 +52,7 @@ extern "C" __global__ void fattn_bwd_dot_f32_d64(
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) x += __shfl_xor_sync(0xffffffffu, x, off);
   if (lane == 0) dsum[row] = x;
+  if (lane == 0 && i % KB_QRYS == 0) turn[row / S * ((S + KB_QRYS - 1) / KB_QRYS) + i / KB_QRYS] = 0;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -76,16 +85,37 @@ __device__ __forceinline__ void load_tile4(float* dst, const float* __restrict__
   }
 }
 
-// dK, dV. grid (ceil(S / 64), H, B). A block owns 64 keys and walks query tiles of 32.
+// The dQ turn of one query tile: wait until `kb` key blocks have added theirs (thread 0 spins,
+// acquire at GPU scope), then pass it on (release). PyTorch's `AtomicLock` (`kernel_backward.h`)
+// is the pattern, with one change: the turn goes in key-block order, not to whoever arrives.
+__device__ __forceinline__ void wait_turn(const int* p, int kb) {
+  int seen;
+  for (;;) {
+    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(seen) : "l"(p) : "memory");
+    if (seen == kb) break;
+    __nanosleep(32);
+  }
+}
+
+__device__ __forceinline__ void pass_turn(int* p, int next) {
+  asm volatile("st.release.gpu.global.b32 [%0], %1;" : : "l"(p), "r"(next) : "memory");
+}
+
+// dK, dV, dQ. grid (ceil(S / 64), H, B). A block owns key block kb = blockIdx.x (64 keys) and walks
+// query tiles of 32.
 //   phase 1: S and dP for [32 queries x 64 keys]; thread (ty = tid / 16, tx = tid % 16) owns
 //            query rows 2ty, 2ty+1 and keys tx + 16 jj; P and dS go to shared memory.
 //   phase 2: thread owns keys 4 (tid / 16) .. +4 and dims 4 (tid % 16) .. +4 of dV and dK.
-#define KB_KEYS 64
-#define KB_QRYS 32
-extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dkdv_f32_d64(
+//   phase 3: thread owns queries 2 (tid / 16), +1 and dims 4 (tid % 16) .. +4 of the tile's dQ
+//            partial dS K; on its turn the block adds it into dQ: key block 0 stores, the others
+//            read (through L2) and add, the last contributor scales. The tile's dQ is thus
+//            ((p0 + p1) + p2) + ... in key-block order, whatever the scheduling.
+// No deadlock: a block waits only on LOWER key blocks of its own (b, h), which have lower linear
+// block indices and so were dispatched first (the assumption CUTLASS's serial split-K makes).
+extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ d_o, const float* __restrict__ lse, const float* __restrict__ dsum,
-    float* __restrict__ dqkv,
+    float* __restrict__ dqkv, int* __restrict__ turn,
     int B, int H, int S, float scale, int causal,
     int64_t q_sb, int64_t q_sh, int64_t q_ss,
     int64_t k_sb, int64_t k_sh, int64_t k_ss,
@@ -99,9 +129,11 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dkdv_f32_d64(
   float* Ps = dOs + KB_QRYS * LD;               // [32][LD], query-major
   float* dSs = Ps + KB_QRYS * LD;               // [32][LD], query-major
 
-  const int b = blockIdx.z, h = blockIdx.y, k0 = blockIdx.x * KB_KEYS;
+  const int b = blockIdx.z, h = blockIdx.y, kb = blockIdx.x, k0 = kb * KB_KEYS;
   const int tid = threadIdx.x, ty = tid / 16, tx = tid % 16;
   const int j0 = 4 * (tid / 16), d0 = 4 * (tid % 16);  // phase-2 ownership
+  const int i0 = 2 * (tid / 16);                       // phase-3 ownership (and d0)
+  int* tp = turn + ((int64_t)b * H + h) * ((S + KB_QRYS - 1) / KB_QRYS);
   const float* qp = q + b * q_sb + h * q_sh;
   const float* gp = d_o + b * do_sb + h * do_sh;
   const float* lp = lse + ((int64_t)b * H + h) * S;
@@ -173,6 +205,60 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dkdv_f32_d64(
           adk[a][e] = fmaf(sa[a], qa[e], adk[a][e]);
         }
     }
+
+    // dQ partial: pq[r][e] = sum_j dS[i0 + r][j] K[j][d0 + e], four keys at a time
+    float pq[2][4];
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) pq[r][e] = 0.0f;
+#pragma unroll 2
+    for (int j = 0; j < KB_KEYS; j += 4) {
+      const float4 s0 = ld4(dSs + i0 * LD + j), s1 = ld4(dSs + (i0 + 1) * LD + j);
+      const float sa[2][4] = {{s0.x, s0.y, s0.z, s0.w}, {s1.x, s1.y, s1.z, s1.w}};
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const float4 k4 = ld4(Ks + (j + t) * LD + d0);
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          pq[r][0] = fmaf(sa[r][t], k4.x, pq[r][0]);
+          pq[r][1] = fmaf(sa[r][t], k4.y, pq[r][1]);
+          pq[r][2] = fmaf(sa[r][t], k4.z, pq[r][2]);
+          pq[r][3] = fmaf(sa[r][t], k4.w, pq[r][3]);
+        }
+      }
+    }
+
+    // This tile's contributors are key blocks 0 .. last (causal: those holding a key <= the
+    // tile's last query); each adds on its turn.
+    const int t = q0 / KB_QRYS;
+    const int last = causal ? min((int)gridDim.x - 1, min(S - 1, q0 + KB_QRYS - 1) / KB_KEYS)
+                            : (int)gridDim.x - 1;
+    if (kb > 0) {
+      if (tid == 0) {
+        wait_turn(tp + t, kb);
+        __threadfence();
+      }
+      __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int i = q0 + i0 + r;
+      if (i >= S) continue;
+      float4* dst = reinterpret_cast<float4*>(dqkv + ((int64_t)b * S + i) * (3 * H * HD) + h * HD + d0);
+      float4 acc = make_float4(pq[r][0], pq[r][1], pq[r][2], pq[r][3]);
+      if (kb > 0) {
+        const float4 prev = __ldcg(dst);
+        acc = make_float4(prev.x + acc.x, prev.y + acc.y, prev.z + acc.z, prev.w + acc.w);
+      }
+      if (kb == last) acc = make_float4(acc.x * scale, acc.y * scale, acc.z * scale, acc.w * scale);
+      __stcg(dst, acc);
+    }
+    if (kb < last) {
+      __threadfence();  // every thread's dQ stores visible GPU-wide before the turn passes
+      __syncthreads();
+      if (tid == 0) pass_turn(tp + t, kb + 1);
+    }
   }
 
 #pragma unroll
@@ -183,112 +269,6 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dkdv_f32_d64(
     *reinterpret_cast<float4*>(dqkv + H * HD + off) =
         make_float4(adk[a][0] * scale, adk[a][1] * scale, adk[a][2] * scale, adk[a][3] * scale);
     *reinterpret_cast<float4*>(dqkv + 2 * H * HD + off) = make_float4(adv[a][0], adv[a][1], adv[a][2], adv[a][3]);
-  }
-}
-
-// dQ. grid (ceil(S / 64), H, B). A block owns 64 queries and walks key tiles of 32.
-//   phase 1: S and dP for [64 queries x 32 keys]; thread (ty = tid / 8, tx = tid % 8) owns query
-//            rows 2ty, 2ty+1 and keys tx + 8 jj; dS goes to shared memory TRANSPOSED (key-major).
-//   phase 2: thread owns queries 4 (tid / 16) .. +4 and dims 4 (tid % 16) .. +4 of dQ.
-#define QB_QRYS 64
-#define QB_KEYS 32
-extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_dq_f32_d64(
-    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-    const float* __restrict__ d_o, const float* __restrict__ lse, const float* __restrict__ dsum,
-    float* __restrict__ dqkv,
-    int B, int H, int S, float scale, int causal,
-    int64_t q_sb, int64_t q_sh, int64_t q_ss,
-    int64_t k_sb, int64_t k_sh, int64_t k_ss,
-    int64_t v_sb, int64_t v_sh, int64_t v_ss,
-    int64_t do_sb, int64_t do_sh, int64_t do_ss) {
-  extern __shared__ float4 smem4[];
-  float* Qs = reinterpret_cast<float*>(smem4);  // [64][LD]
-  float* dOs = Qs + QB_QRYS * LD;               // [64][LD]
-  float* Ks = dOs + QB_QRYS * LD;               // [32][LD]
-  float* Vs = Ks + QB_KEYS * LD;                // [32][LD]
-  float* dSt = Vs + QB_KEYS * LD;               // [32][LD], key-major
-
-  const int b = blockIdx.z, h = blockIdx.y, q0 = blockIdx.x * QB_QRYS;
-  const int tid = threadIdx.x, ty = tid / 8, tx = tid % 8;
-  const int i0 = 4 * (tid / 16), d0 = 4 * (tid % 16);  // phase-2 ownership
-  const float* kp = k + b * k_sb + h * k_sh;
-  const float* vp = v + b * v_sb + h * v_sh;
-
-  load_tile4(Qs, q + b * q_sb + h * q_sh, q_ss, q0, QB_QRYS, S);
-  load_tile4(dOs, d_o + b * do_sb + h * do_sh, do_ss, q0, QB_QRYS, S);
-
-  float li[2], di[2];
-#pragma unroll
-  for (int r = 0; r < 2; ++r) {
-    const int i = q0 + 2 * ty + r;
-    li[r] = i < S ? lse[((int64_t)b * H + h) * S + i] : 0.0f;
-    di[r] = i < S ? dsum[((int64_t)b * H + h) * S + i] : 0.0f;
-  }
-
-  float adq[4][4];
-#pragma unroll
-  for (int a = 0; a < 4; ++a)
-#pragma unroll
-    for (int e = 0; e < 4; ++e) adq[a][e] = 0.0f;
-
-  const int k_end = causal ? min(S, q0 + QB_QRYS) : S;
-  for (int k0 = 0; k0 < k_end; k0 += QB_KEYS) {
-    __syncthreads();
-    load_tile4(Ks, kp, k_ss, k0, QB_KEYS, S);
-    load_tile4(Vs, vp, v_ss, k0, QB_KEYS, S);
-    __syncthreads();
-
-    float s[2][4], dpv[2][4];
-#pragma unroll
-    for (int r = 0; r < 2; ++r)
-#pragma unroll
-      for (int jj = 0; jj < 4; ++jj) s[r][jj] = dpv[r][jj] = 0.0f;
-#pragma unroll 4
-    for (int c = 0; c < HD; c += 4) {
-      const float4 q0v = ld4(Qs + (2 * ty) * LD + c), q1v = ld4(Qs + (2 * ty + 1) * LD + c);
-      const float4 g0v = ld4(dOs + (2 * ty) * LD + c), g1v = ld4(dOs + (2 * ty + 1) * LD + c);
-#pragma unroll
-      for (int jj = 0; jj < 4; ++jj) {
-        const float4 kv = ld4(Ks + (tx + 8 * jj) * LD + c);
-        const float4 vv = ld4(Vs + (tx + 8 * jj) * LD + c);
-        s[0][jj] = dot4(q0v, kv, s[0][jj]);
-        s[1][jj] = dot4(q1v, kv, s[1][jj]);
-        dpv[0][jj] = dot4(g0v, vv, dpv[0][jj]);
-        dpv[1][jj] = dot4(g1v, vv, dpv[1][jj]);
-      }
-    }
-#pragma unroll
-    for (int r = 0; r < 2; ++r) {
-      const int il = 2 * ty + r, i = q0 + il;
-#pragma unroll
-      for (int jj = 0; jj < 4; ++jj) {
-        const int jl = tx + 8 * jj, j = k0 + jl;
-        const bool live = i < S && j < S && !(causal && j > i);
-        const float p = live ? expf(s[r][jj] * scale - li[r]) : 0.0f;
-        dSt[jl * LD + il] = p * (dpv[r][jj] - di[r]);
-      }
-    }
-    __syncthreads();
-
-    // dQ[i] += sum_j dS[i][j] K[j]
-#pragma unroll 4
-    for (int j = 0; j < QB_KEYS; ++j) {
-      const float4 s4 = ld4(dSt + j * LD + i0), k4 = ld4(Ks + j * LD + d0);
-      const float sa[4] = {s4.x, s4.y, s4.z, s4.w}, ka[4] = {k4.x, k4.y, k4.z, k4.w};
-#pragma unroll
-      for (int a = 0; a < 4; ++a)
-#pragma unroll
-        for (int e = 0; e < 4; ++e) adq[a][e] = fmaf(sa[a], ka[e], adq[a][e]);
-    }
-  }
-
-#pragma unroll
-  for (int a = 0; a < 4; ++a) {
-    const int i = q0 + i0 + a;
-    if (i >= S) continue;
-    const int64_t off = ((int64_t)b * S + i) * (3 * H * HD) + h * HD + d0;
-    *reinterpret_cast<float4*>(dqkv + off) =
-        make_float4(adq[a][0] * scale, adq[a][1] * scale, adq[a][2] * scale, adq[a][3] * scale);
   }
 }
 
