@@ -6,12 +6,17 @@
 //!   and returns the merged `[batch, seq, heads·head_dim]` output. Its backward writes ONE
 //!   gradient, interleaved exactly as the projection is: no head split, no head merge, and none
 //!   of the per-view zero padding and summing candle's `narrow` backward would otherwise do
-//!   (measured: ~3.7 ms of glue per layer at b 64 · h 6 · s 240, more than half the kernels' time).
-//! - [`fused_attention`] takes `[batch, heads, seq, head_dim]` `q`, `k`, `v` (any strides with
-//!   `head_dim` contiguous).
+//!   (measured with `bench/compare.py` at b 64 · h 6 · s 240, RTX 5060 Ti: 4.97 ms of kernel time
+//!   per forward + backward, against 11.99 ms through [`fused_attention`] on three `narrow` views).
+//! - [`fused_attention`] takes `[batch, heads, seq, head_dim]` `q`, `k`, `v` with any strides.
+//!
+//! Both read their operands in place when `head_dim` is contiguous and every other stride and the
+//! offset are multiples of 4 floats (the kernels load rows as `float4`), and copy them to a
+//! contiguous tensor first otherwise.
 //!
 //! On CUDA: a FlashAttention-2-style forward (online softmax, the `[seq, seq]` scores never
-//! written) and a deterministic two-kernel backward. On CPU: the composed reference, so every
+//! written) and a deterministic backward in two kernels: `D = rowsum(dO ∘ O)`, then one pass per
+//! key block that adds the dQ partials in key-block order. On CPU: the composed reference, so every
 //! test runs anywhere. It works against STOCK candle: the PTX is loaded into candle's own context
 //! and launched on candle's own stream.
 //!
@@ -91,8 +96,8 @@ pub(crate) type Dims = (usize, usize, usize, usize);
 ///
 /// # Errors
 ///
-/// On a dtype other than f32, a last dimension not divisible by `3·heads`, or (CUDA) a head
-/// dimension other than [`CUDA_HEAD_DIM`].
+/// On a dtype other than f32, zero `heads` or a last dimension not divisible by `3·heads`, or
+/// (CUDA) a head dimension other than [`CUDA_HEAD_DIM`].
 pub fn fused_attention_qkv(qkv: &Tensor, heads: usize, scale: f32, causal: bool) -> Result<Tensor> {
     let l = qkv.layout();
     let aligned = l.start_offset().is_multiple_of(4)
@@ -114,7 +119,8 @@ pub fn fused_attention_qkv(qkv: &Tensor, heads: usize, scale: f32, causal: bool)
 /// `causal`.
 ///
 /// # Shapes
-/// - `q`: `[batch, heads, seq, head_dim]` f32 -- any strides with `head_dim` contiguous
+/// - `q`: `[batch, heads, seq, head_dim]` f32 -- any strides (copied first when the kernels
+///   cannot read them in place, see the crate documentation)
 /// - `k`: `[batch, heads, seq, head_dim]` f32 -- same shape and device as `q`
 /// - `v`: `[batch, heads, seq, head_dim]` f32 -- same shape and device as `q`
 /// - returns: `[batch, heads, seq, head_dim]` -- a transposed view of a contiguous
@@ -123,8 +129,8 @@ pub fn fused_attention_qkv(qkv: &Tensor, heads: usize, scale: f32, causal: bool)
 ///
 /// # Errors
 ///
-/// On a dtype other than f32, mismatched shapes or devices, a non-contiguous last dimension, or
-/// (CUDA) a head dimension other than [`CUDA_HEAD_DIM`].
+/// On a dtype other than f32, mismatched shapes or devices, or (CUDA) a head dimension other than
+/// [`CUDA_HEAD_DIM`].
 pub fn fused_attention(
     q: &Tensor,
     k: &Tensor,
