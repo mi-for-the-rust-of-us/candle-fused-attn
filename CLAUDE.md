@@ -64,9 +64,10 @@ caught a script committed without its executable bit, which would have failed th
    fresh empty `## [Unreleased]` above it; update any version the README states. Commit as
    `bump version to vX.Y.Z, update changelog date`.
 3. **Then `scripts/ci-local.sh` again.** Against the bumped version it now ends with `cargo publish
-   --dry-run`, which contacts the registry: it catches a version already taken, missing metadata,
-   `exclude` rules and the 10 MiB cap. Run before the bump, it would only prove the version
-   already published.
+   --dry-run`, which packages and builds exactly what will ship: missing metadata, `exclude`
+   rules, the 10 MiB cap. It does **not** catch a version already on crates.io: it stops before the
+   upload, and the registry rejects a taken version only at upload (checked 2026-10-03: the dry
+   run passed for 0.2.0 after 0.2.0 was published). The bump in step 2 is what prevents that.
 4. **Push `main`, wait for CI to go GREEN.**
 5. **Rehearse the publish workflow** on that commit:
    `git tag vX.Y.Z-rc.N; git push origin vX.Y.Z-rc.N`. Pushing a hyphenated tag starts nothing (the
