@@ -304,7 +304,7 @@ a doc comment). It states:
 > ```rust
 > // SAFETY: reads q, k, v through their (float4-aligned) strides inside their storages
 > // (shape-checked by the caller), writes all of `o` and `lse`.
-> unsafe { builder.launch(grid(dims, FWD_SMEM)?) }.w()?;
+> unsafe { builder.launch(grid(dims, FWD_QUERIES, FWD_SMEM)?) }.w()?;
 > ```
 
 ### Accepted `unsafe` scope
@@ -434,8 +434,8 @@ changing one side finds the other. (A kernel's *argument list* is not a constant
 > ```
 
 Shared-memory sizes are derived from the **named** tile constants in one expression on the Rust
-side — `(2 * KEYS + 4 * QUERIES) * LD * size_of::<f32>()`, each name a `TWIN` — never typed as a
-bare byte count nor as bare literals.
+side — `(2 * BWD_KEYS + 4 * QUERY_TILE) * LD * size_of::<f32>()`, each name a `TWIN` — never
+typed as a bare byte count nor as bare literals.
 
 ### Launch bounds and shared memory
 

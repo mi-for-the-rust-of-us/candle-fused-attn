@@ -175,7 +175,7 @@ for step in 0..3 {
 
 ## 6. Measure the speed on your card
 
-`bench/compare.py` compares the op with `PyTorch`'s fp32 attentions at a shape of your choice,
+`bench/compare.py` compares the op with PyTorch's fp32 attentions at a shape of your choice,
 speed **and** accuracy against an fp64 reference (it needs `torch` and `safetensors`; `nsys` is
 optional):
 
@@ -185,13 +185,14 @@ python bench/compare.py run --batch 64 --heads 6 --seq 240
 
 Three rules make its numbers mean something: alternate the candidates in rounds within one session;
 discard the first run of a freshly built binary (the driver compiles its kernels then); and compare
-with `PyTorch` only on the same machine, in the same session.
+with PyTorch only on the same machine, in the same session.
 
 ## 7. When not to use it
 
 - `head_dim` other than 64, or dtypes other than f32, on CUDA.
 - You need the attention weights themselves (for interpretability hooks, for instance): the fused
-  forward never materialises them. [candle-mi](https://github.com/mi-for-the-rust-of-us/candle-mi)
-  takes the fused path only when no attention-internal hook is requested.
+  forward never materialises them. [candle-mi](https://github.com/mi-for-the-rust-of-us/candle-mi)'s
+  integration (in development) takes the fused path only when no attention-internal hook is
+  requested.
 - Dropout on the attention weights, or an additive mask other than causal.
 - A GPU older than Volta (compute capability 7.0).
