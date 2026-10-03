@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly canary: catches rolling-stable lint breakage between pushes.
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+# Read-only workflow token: nothing in this workflow writes to the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# WHAT CI CANNOT CHECK. GitHub's runners have neither a GPU nor the CUDA toolkit, and the `cuda`
+# feature compiles its kernels with nvcc at build time (build.rs), so CI covers the CPU path only:
+# the composed reference, the public API, its docs, and the gradient tests that run anywhere. The
+# CUDA kernels are gated by `cargo test --features cuda` on a CUDA machine (tests/parity.rs: CUDA vs
+# CPU within the measured band, and bitwise-identical reruns of the backward) and by the
+# benchmark, `bench/compare.py`, before every release.
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # The MSRV of the org's leaf libraries (anamnesis, hypomnesis), and this crate's floor.
+          - name: "MSRV (1.88)"
+            toolchain: "1.88"
+          - name: "Stable"
+            toolchain: "stable"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (v1)
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (CPU path)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Tests (CPU path)
+        run: cargo test --locked
+
+      # The tutorial's code runs, and every code block of docs/tutorial.md is that code.
+      - name: Tutorial (CPU path)
+        run: cargo run --locked --example tutorial
+
+      - name: Tutorial blocks match the example
+        run: |
+          python3 -m doctest scripts/check-tutorial.py
+          python3 scripts/check-tutorial.py
+
+  docs:
+    name: "Docs (private items)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (v1)
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # What docs.rs renders is the crate's public face; a broken intra-doc link cannot be fixed
+      # without cutting another release.
+      - name: Rustdoc
+        run: cargo doc --locked --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  deny:
+    name: "Dependencies (cargo-deny)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
