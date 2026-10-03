@@ -1,17 +1,29 @@
 [package]
 name = "candle-fused-attn"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+# The MSRV of the org's leaf libraries (anamnesis, hypomnesis); also this crate's true floor:
+# candle-core 0.11 pulls zip 8.6, which needs 1.88 (built and tested with +1.88 --locked).
+rust-version = "1.88"
 authors = ["Eric Jacopin"]
-description = "A fused fp32 scaled-dot-product attention for candle, forward AND backward (FlashAttention-2 algorithm, deterministic backward), as a CustomOp3 over stock candle."
+description = "Fused fp32 scaled-dot-product attention for candle, forward AND backward: the FlashAttention-2 algorithm in plain fp32, a bit-reproducible backward, over stock candle."
 license = "MIT OR Apache-2.0"
-keywords = ["candle", "attention", "cuda", "flash-attention", "training"]
+keywords = ["candle", "attention", "fp32", "cuda", "training"]
 categories = ["science", "algorithms"]
-publish = false
+repository = "https://github.com/mi-for-the-rust-of-us/candle-fused-attn"
+homepage = "https://github.com/mi-for-the-rust-of-us/candle-fused-attn"
+documentation = "https://docs.rs/candle-fused-attn"
+readme = "README.md"
+# The benchmark's outputs and local Python caches are not part of the crate.
+exclude = ["target/", "bench/__pycache__/", ".github/"]
+publish = false  # flipped by hand at the first release, on Eric's go
 
 [dependencies]
 candle-core = "0.11"
+
+# docs.rs has no CUDA toolkit: it documents the default (CPU) feature set.
+[package.metadata.docs.rs]
+no-default-features = true
 
 [build-dependencies]
 cudaforge = { version = "0.1.6", optional = true }
