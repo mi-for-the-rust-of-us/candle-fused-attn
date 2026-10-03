@@ -1,0 +1,2 @@
+# Shell scripts run on Linux runners: always LF, whatever core.autocrlf says on Windows.
+*.sh text eol=lf
