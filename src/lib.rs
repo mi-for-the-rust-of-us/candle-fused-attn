@@ -15,6 +15,34 @@
 //! test runs anywhere. It works against STOCK candle: the PTX is loaded into candle's own context
 //! and launched on candle's own stream.
 //!
+//! # Example
+//!
+//! One attention layer, forward and backward, straight from a fused qkv projection. This runs on
+//! the CPU (the composed reference); with the `cuda` feature and a CUDA tensor, the same call runs
+//! the fused kernels.
+//!
+//! ```
+//! use candle_core::{Device, Tensor, Var};
+//!
+//! let (batch, seq, heads, head_dim) = (2, 16, 4, 64);
+//! let qkv = Tensor::randn(0f32, 1.0, (batch, seq, 3 * heads * head_dim), &Device::Cpu)?;
+//! let qkv = Var::from_tensor(&qkv)?;
+//!
+//! // softmax(q·kᵀ / √64)·v, heads split and merged inside the op.
+//! let o = candle_fused_attn::fused_attention_qkv(qkv.as_tensor(), heads, 0.125, false)?;
+//! assert_eq!(o.dims(), &[batch, seq, heads * head_dim]);
+//!
+//! // ONE gradient, laid out exactly like the projection.
+//! let grads = o.sum_all()?.backward()?;
+//! let dqkv = grads.get(&qkv).ok_or_else(|| candle_core::Error::Msg("no gradient".into()))?;
+//! assert_eq!(dqkv.dims(), qkv.dims());
+//! # Ok::<(), candle_core::Error>(())
+//! ```
+//!
+//! A step-by-step guide — replacing a composed attention, checking it on your own shapes,
+//! checking determinism, measuring the speed, and when not to use it — is in
+//! [`docs/tutorial.md`](https://github.com/mi-for-the-rust-of-us/candle-fused-attn/blob/main/docs/tutorial.md).
+//!
 //! # The saved state
 //!
 //! candle's custom ops have no channel for intermediates kept from the forward for the backward,
@@ -22,10 +50,11 @@
 //! The op therefore keeps the per-row log-sum-exp `L` (`[b, h, s]`, 1/64 of `O`) in a field, and
 //! its output is `O` alone. (kaio-candle, the prior art, instead re-runs the forward in `bwd`.)
 //!
-//! # Limits (v0.1)
+//! # Limits (v0.2)
 //!
 //! f32 only; on CUDA `head_dim` must be 64 (the CPU path takes any). No dropout, no additive
-//! mask beyond `causal`.
+//! mask beyond `causal`. The backward's dQ turn counters use `ld.acquire` / `st.release` at GPU
+//! scope, so the CUDA path needs compute capability 7.0 (Volta) or newer.
 
 // EXPLICIT: `b, h, s, d` (batch, heads, seq, head_dim) and `q, k, v, o, l` are the notation of the
 // attention papers this code follows; longer names would hide the math.
@@ -46,11 +75,15 @@ pub const CUDA_HEAD_DIM: usize = 64;
 /// `(batch, heads, seq, head_dim)`.
 pub(crate) type Dims = (usize, usize, usize, usize);
 
-/// Fused attention over a fused qkv projection.
+/// Fused attention over a fused qkv projection: `softmax(q·kᵀ·scale)·v`, rows `j > i` masked
+/// when `causal`.
 ///
-/// `qkv`: f32 `[batch, seq, 3·heads·head_dim]`, laid out `[q | k | v]` along the last dimension,
-/// each third split into `heads` heads of `head_dim` (the layout of a fused `c_attn`/`qkv` linear).
-/// Returns `[batch, seq, heads·head_dim]`, heads merged.
+/// # Shapes
+/// - `qkv`: `[batch, seq, 3·heads·head_dim]` f32 -- laid out `[q | k | v]` along the last
+///   dimension, each third split into `heads` heads of `head_dim` (a fused `c_attn`/`qkv` linear)
+/// - returns: `[batch, seq, heads·head_dim]` -- heads merged
+///
+/// The backward writes one gradient shaped like `qkv`.
 ///
 /// # Errors
 ///
@@ -58,8 +91,8 @@ pub(crate) type Dims = (usize, usize, usize, usize);
 /// dimension other than [`CUDA_HEAD_DIM`].
 pub fn fused_attention_qkv(qkv: &Tensor, heads: usize, scale: f32, causal: bool) -> Result<Tensor> {
     let l = qkv.layout();
-    let aligned = l.start_offset() % 4 == 0
-        && matches!(l.stride(), &[sb, ss, 1] if sb % 4 == 0 && ss % 4 == 0);
+    let aligned = l.start_offset().is_multiple_of(4)
+        && matches!(l.stride(), &[sb, ss, 1] if sb.is_multiple_of(4) && ss.is_multiple_of(4));
     let qkv = if aligned {
         qkv.clone()
     } else {
@@ -76,9 +109,13 @@ pub fn fused_attention_qkv(qkv: &Tensor, heads: usize, scale: f32, causal: bool)
 /// Fused scaled-dot-product attention: `softmax(q·kᵀ·scale)·v`, rows `j > i` masked when
 /// `causal`.
 ///
-/// `q`, `k`, `v`: f32, `[batch, heads, seq, head_dim]`, one shape, one device; the last dimension
-/// contiguous. Returns `[batch, heads, seq, head_dim]` (a transposed view of a contiguous
-/// `[batch, seq, heads, head_dim]` buffer, so a merge-heads `transpose(1, 2).reshape(..)` is free).
+/// # Shapes
+/// - `q`: `[batch, heads, seq, head_dim]` f32 -- any strides with `head_dim` contiguous
+/// - `k`: `[batch, heads, seq, head_dim]` f32 -- same shape and device as `q`
+/// - `v`: `[batch, heads, seq, head_dim]` f32 -- same shape and device as `q`
+/// - returns: `[batch, heads, seq, head_dim]` -- a transposed view of a contiguous
+///   `[batch, seq, heads, head_dim]` buffer, so a merge-heads `transpose(1, 2).reshape(..)` is
+///   free
 ///
 /// # Errors
 ///
@@ -107,8 +144,8 @@ pub fn fused_attention(
 /// Whether a `[b, h, s, d]` layout's offset and (batch, head, seq) strides are multiples of 4
 /// floats, `d` contiguous: the CUDA kernels read rows as float4.
 fn float4_aligned(l: &Layout) -> bool {
-    l.start_offset() % 4 == 0
-        && matches!(l.stride(), &[sb, sh, ss, 1] if sb % 4 == 0 && sh % 4 == 0 && ss % 4 == 0)
+    l.start_offset().is_multiple_of(4)
+        && matches!(l.stride(), &[sb, sh, ss, 1] if sb.is_multiple_of(4) && sh.is_multiple_of(4) && ss.is_multiple_of(4))
 }
 
 /// `t` itself when [`float4_aligned`], else a contiguous copy (a contiguous `[b, h, s, d]` tensor
@@ -313,9 +350,9 @@ fn cuda_backward(
 /// contiguous copy.
 fn aligned_grad(grad: &Tensor) -> Result<Tensor> {
     let l = grad.layout();
-    let ok = l.start_offset() % 4 == 0
+    let ok = l.start_offset().is_multiple_of(4)
         && l.stride().last() == Some(&1)
-        && l.stride().iter().all(|s| *s == 1 || s % 4 == 0);
+        && l.stride().iter().all(|s| *s == 1 || s.is_multiple_of(4));
     if ok {
         Ok(grad.clone())
     } else {
