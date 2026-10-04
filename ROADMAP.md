@@ -43,6 +43,8 @@ logits max-abs-diff 3.1e-5 on CUDA, where the composed attention gives 3.4e-5.
 
 ## Next: v0.3.0 — a faster forward
 
+Plan, predictions and results as they come: [`docs/roadmap-v0.3.0.md`](docs/roadmap-v0.3.0.md).
+
 **Why.** The forward is the one place this crate is behind: ×1.5 SDPA's time on the 5060 Ti,
 ×1.09 on the 5090. It also runs more often than it looks. In the canvas trainer it runs about
 three times per layer and step — the carry's no-grad pass, the training pass, the validation
