@@ -49,11 +49,13 @@ const LD: usize = 68; // TWIN: kernels/fused_attn.cu:LD
 // CAST: usize → u32, 69,632 bytes
 #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
 const FWD_SMEM: u32 = ((2 * FWD_QUERIES + 2 * FWD_KEYS) * LD * size_of::<f32>()) as u32;
-/// Dynamic shared memory of the backward kernel, in bytes: K and V ([`BWD_KEYS`] rows), Q, dO, P
-/// and dS ([`QUERY_TILE`] rows), [`LD`] floats each: 69,632 bytes.
-// CAST: usize → u32, 69,632 bytes
+/// Dynamic shared memory of the backward kernel, in bytes: K and V ([`BWD_KEYS`] rows); Q and dO
+/// twice, the current and the next query tile, P and dS ([`QUERY_TILE`] rows each), [`LD`] floats
+/// per row; then L and D of both tiles ([`QUERY_TILE`] floats each): 87,552 bytes.
+// CAST: usize → u32, 87,552 bytes
 #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-const BWD_SMEM: u32 = ((2 * BWD_KEYS + 4 * QUERY_TILE) * LD * size_of::<f32>()) as u32;
+const BWD_SMEM: u32 =
+    (((2 * BWD_KEYS + 6 * QUERY_TILE) * LD + 4 * QUERY_TILE) * size_of::<f32>()) as u32;
 
 /// A `[b, h, s, d]` operand on the device: its first element and its (batch, head, seq) strides
 /// in floats (`d` contiguous).

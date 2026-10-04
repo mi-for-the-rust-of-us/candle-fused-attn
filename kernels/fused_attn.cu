@@ -134,6 +134,25 @@ __device__ __forceinline__ void cp_async_wait_all() {
 #endif
 }
 
+// `n` consecutive floats of a row vector (L or D) from `src + row0` into `dst`, zero past `seq`;
+// 4-byte copies, since these rows are not 16-byte aligned for every sequence length. Same switch
+// as load_tile_async: `cp.async` on 8.0+, ordinary loads below or under -DFATTN_SYNC_LOADS.
+__device__ __forceinline__ void load_row_async(float* dst, const float* __restrict__ src, int row0,
+                                               int n, int seq) {
+  for (int i = threadIdx.x; i < n; i += NT) {
+    const int row = row0 + i;
+#if __CUDA_ARCH__ >= 800 && !defined(FATTN_SYNC_LOADS)
+    const float* g = src + (row < seq ? row : row0);
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(dst + i));
+    const int bytes = row < seq ? 4 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(s), "l"(g), "r"(bytes)
+                 : "memory");
+#else
+    dst[i] = row < seq ? src[row] : 0.0f;
+#endif
+  }
+}
+
 // The dQ turn of one query tile: wait until `kb` key blocks have added theirs (thread 0 spins,
 // acquire at GPU scope), then pass it on (release).
 // REFERENCE: `AtomicLock` in kernel_backward.h (PyTorch v2.10, mem_eff_attention) -- the
@@ -172,8 +191,13 @@ __device__ __forceinline__ void pass_turn(int* p, int next) {
 // kernel_backward.h (PyTorch v2.10, mem_eff_attention) -- one pass per key block, S and dP computed
 // once. Departs from both on dQ: added in key-block ORDER (FA-2: fp32 atomicAdd; PyTorch: arrival
 // order under a lock), so the backward is deterministic.
-// Shared memory: dynamic, (2 KB_KEYS + 4 KB_QRYS) LD floats = 69,632 B (68 KB; TWIN:
-// src/cuda.rs:BWD_SMEM): one block per SM on the RTX 5060 Ti (measured).
+// Loads overlap the math (devlog FA9): the NEXT query tile's Q, dO, L and D are copied into a
+// second buffer while the current tile computes (double buffering), then the buffers swap.
+// REFERENCE: flash_bwd_kernel.h (FlashAttention-2, Dao-AILab upstream) -- its `Double_buffer`
+// alternates sQ between two halves; departs by double-buffering dO too (FA-2 reloads its single
+// sdO after the dV GEMM): here dO is read until phase 2, so one buffer would overlap phase 3 only.
+// Shared memory: dynamic, (2 KB_KEYS + 6 KB_QRYS) LD + 4 KB_QRYS floats = 87,552 B (85.5 KB; TWIN:
+// src/cuda.rs:BWD_SMEM): one block per SM on the RTX 5060 Ti.
 extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ d_o, const float* __restrict__ lse, const float* __restrict__ dsum,
@@ -186,10 +210,11 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
   extern __shared__ float4 smem4[];
   float* Ks = reinterpret_cast<float*>(smem4);  // [64][LD]
   float* Vs = Ks + KB_KEYS * LD;                // [64][LD]
-  float* Qs = Vs + KB_KEYS * LD;                // [32][LD]
-  float* dOs = Qs + KB_QRYS * LD;               // [32][LD]
-  float* Ps = dOs + KB_QRYS * LD;               // [32][LD], query-major
+  float* Qb = Vs + KB_KEYS * LD;                // [2][32][LD]: Q, current and next query tile
+  float* dOb = Qb + 2 * KB_QRYS * LD;           // [2][32][LD]: dO, the same
+  float* Ps = dOb + 2 * KB_QRYS * LD;           // [32][LD], query-major
   float* dSs = Ps + KB_QRYS * LD;               // [32][LD], query-major
+  float* LDb = dSs + KB_QRYS * LD;              // [2][2][32]: L then D, current and next tile
 
   const int b = blockIdx.z, h = blockIdx.y, kb = blockIdx.x, k0 = kb * KB_KEYS;
   const int tid = threadIdx.x, ty = tid / 16, tx = tid % 16;
@@ -212,11 +237,29 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
 
   // Causal: queries before the block's first key never see it.
   const int q_begin = causal ? (k0 / KB_QRYS) * KB_QRYS : 0;
-  for (int q0 = q_begin; q0 < S; q0 += KB_QRYS) {
+  // Prologue: the first query tile into buffer 0, one group of copies.
+  load_tile_async(Qb, qp, q_ss, q_begin, KB_QRYS, S);
+  load_tile_async(dOb, gp, do_ss, q_begin, KB_QRYS, S);
+  load_row_async(LDb, lp, q_begin, KB_QRYS, S);
+  load_row_async(LDb + KB_QRYS, dp_, q_begin, KB_QRYS, S);
+  cp_async_commit();
+  for (int q0 = q_begin, buf = 0; q0 < S; q0 += KB_QRYS, buf ^= 1) {
+    // This tile has landed for every thread, and every thread is done with the previous
+    // iteration (its buffer, Ps, dSs): the next tile may now be copied into the other buffer.
+    cp_async_wait_all();
     __syncthreads();
-    load_tile4(Qs, qp, q_ss, q0, KB_QRYS, S);
-    load_tile4(dOs, gp, do_ss, q0, KB_QRYS, S);
-    __syncthreads();
+    if (q0 + KB_QRYS < S) {
+      const int nb = buf ^ 1, qn = q0 + KB_QRYS;  // travels during this whole iteration
+      load_tile_async(Qb + nb * KB_QRYS * LD, qp, q_ss, qn, KB_QRYS, S);
+      load_tile_async(dOb + nb * KB_QRYS * LD, gp, do_ss, qn, KB_QRYS, S);
+      load_row_async(LDb + nb * 2 * KB_QRYS, lp, qn, KB_QRYS, S);
+      load_row_async(LDb + nb * 2 * KB_QRYS + KB_QRYS, dp_, qn, KB_QRYS, S);
+      cp_async_commit();
+    }
+    const float* Qs = Qb + buf * KB_QRYS * LD;
+    const float* dOs = dOb + buf * KB_QRYS * LD;
+    const float* Lt = LDb + buf * 2 * KB_QRYS;  // L of this tile, 0 past S
+    const float* Dt = Lt + KB_QRYS;             // D of this tile, 0 past S
 
     float s[2][4], dpv[2][4];
 #pragma unroll
@@ -240,7 +283,7 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
       const int il = 2 * ty + r, i = q0 + il;
-      const float li = i < S ? lp[i] : 0.0f, di = i < S ? dp_[i] : 0.0f;
+      const float li = Lt[il], di = Dt[il];  // i >= S: 0, as v0.2's guarded reads gave
 #pragma unroll
       for (int jj = 0; jj < 4; ++jj) {
         const int jl = tx + 16 * jj, j = k0 + jl;

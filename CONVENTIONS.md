@@ -434,8 +434,8 @@ changing one side finds the other. (A kernel's *argument list* is not a constant
 > ```
 
 Shared-memory sizes are derived from the **named** tile constants in one expression on the Rust
-side — `(2 * BWD_KEYS + 4 * QUERY_TILE) * LD * size_of::<f32>()`, each name a `TWIN` — never
-typed as a bare byte count nor as bare literals.
+side — `((2 * BWD_KEYS + 6 * QUERY_TILE) * LD + 4 * QUERY_TILE) * size_of::<f32>()`, each name a
+`TWIN` — never typed as a bare byte count nor as bare literals.
 
 ### Launch bounds and shared memory
 
