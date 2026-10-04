@@ -16,6 +16,8 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA3](#fa3--the-profiler-is-ready-v030-phase-0c) | 2026-10-04 | can Nsight Compute profile the 5060 Ti? | **yes**, after opening the counters |
 | [FA4](#fa4--reading-sdpas-fp32-forward-pytorch-v210) | 2026-10-04 | how is SDPA's fp32 forward built? | reading: tensor cores (3xTF32); its "3 blocks per SM" does not hold on the 5060 Ti (FA5) |
 | [FA5](#fa5--the-first-profile-both-forward-kernels-at-the-canvas-shape) | 2026-10-04 | why is our forward slower? | P1, P4, P5 **met**; P2 **missed** (SDPA has OUR occupancy); P3 **half missed** (top stall: global loads) |
+| [FA6](#fa6--design-the-forwards-levers-ranked-with-predicted-gains) | 2026-10-04 | which levers, in which order? | design (registered) |
+| [FA7](#fa7--lever-l1-asynchronous-kv-loads-overlapped-with-the-math) | 2026-10-04 | does overlapping the K/V loads with the math close the gap? | registered |
 
 ---
 
@@ -256,3 +258,72 @@ this one computes — what CUTLASS and FlashAttention-2 do), fewer shared-memory
 blocks, 12 warps, per SM by design". It is a `__launch_bounds__` hint to the compiler (it caps
 registers so that 3 blocks could fit); on the RTX 5060 Ti, shared memory admits only 2 blocks of
 SDPA's forward, so it runs 8 warps per SM, like ours.
+
+---
+
+## FA6 — design: the forward's levers, ranked, with predicted gains
+
+*Registered 2026-10-04, before any code. Phase 1's design entry; FA5's decision rule did not rank
+the levers (its top stall, global-memory latency, was a case it had not foreseen).*
+
+**C++ read first.** FlashAttention-2's forward main loop (`flash_fwd_kernel.h`, as vendored in
+candle-flash-attn, lines 414–470; `kernel_traits.h`: `Has_cp_async` iff `__CUDA_ARCH__ >= 800`,
+copies through `SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>`). With ONE K buffer and ONE V buffer it
+overlaps every load with math: wait for K(n), sync, **issue V(n) asynchronously**, compute
+S = Q·K(n)ᵀ while V travels; wait for V(n), sync, **issue K(n+1) asynchronously**, then softmax and
+O += P·V(n) while K travels. Below compute capability 8.0 it falls back to ordinary loads.
+v0.2's loop instead synchronises, loads K and V with ordinary loads (`ld.global` → registers →
+`st.shared`: each thread waits for global memory), synchronises again, computes — every load
+exposed, which is FA5's top stall (long scoreboard, 2.25 of 6.50 cycles between issues).
+
+**The levers, in order.**
+
+| | lever | attacks (FA5) | predicted on the forward kernel (5060 Ti, canvas shape) | cost |
+|---|---|---|---|---|
+| L1 | **asynchronous K/V loads, FA-2's schedule**: `cp.async.cg` 16-byte copies (zero-filled past `seq`), V(n) issued before QKᵀ, K(n+1) before softmax + PV; ordinary loads kept under `__CUDA_ARCH__ < 800` | long scoreboard (2.25) | **−15 to −30 %** (1.387 → 0.97–1.18 ms) | small: the loads and their syncs only; same shared memory, same arithmetic |
+| L2 | **larger per-thread register tiles** (8 × 4 outputs instead of 4 × 4), fewer shared loads per FFMA | short scoreboard (1.74), 12.6 M shared loads | −10 to −20 % after L1 | medium: the thread-to-output mapping of both phases |
+| L3 | **2 blocks per SM**: P out of shared memory (exchanged by warp shuffles within the 16 lanes that produce a row group) and a ≤ 50 KB block | latency hiding by more warps | uncertain; FA5 shows occupancy is not the gap by itself | large |
+
+**Invariants for every lever.** Plain fp32 FFMA (no tensor cores); bitwise reruns; accuracy
+against fp64 no worse than v0.2; CPU parity; candle-mi's `othello-fused` oracle. L1 changes no
+arithmetic and no summation order, so it is held to a stronger bar: **bitwise identity with
+v0.2** (FA7). L2 changes the per-thread accumulation grouping and is held to the accuracy bar.
+
+**Order and stopping.** L1 first, measured alone (FA7). L2 is registered after L1's result, on
+L1's profile. L3 only if L1 + L2 leave the forward short of SDPA's at the canvas shape. The same
+L1 applies to the backward kernel's tile loads; that is a separate entry, after the forward.
+
+---
+
+## FA7 — lever L1: asynchronous K/V loads, overlapped with the math
+
+*Registered 2026-10-04, before any code.*
+
+**Change.** In `fattn_fwd_f32_d64` only: K and V tiles loaded with `cp.async.cg.shared.global`
+(16 bytes per copy, source size 0 past `seq` so the row is zero-filled as today), in FA-2's order —
+K(0) issued in the prologue with Q; per key tile: wait, sync, issue V(n), compute S; wait, sync,
+issue K(n+1), softmax and PV. Same shared-memory layout and size (69,632 B), same tile constants,
+same arithmetic in the same order. Under `__CUDA_ARCH__ < 800`, the v0.2 loads, unchanged.
+`REFERENCE` (FA-2 `flash_fwd_kernel.h`) and `ORDER` annotations as `CONVENTIONS.md` requires.
+
+**Protocol.**
+1. **Bitwise identity**: for the canvas-shape inputs of FA1 and the parity tests' shapes (s = 7,
+   97, 240; causal and not; both entry points), v0.3-L1's O and L equal v0.2's bit for bit; the
+   crate's tests pass (`cargo test --features cuda`), and `scripts/ci-local.sh`.
+2. **The fallback path**: built for `CUDA_COMPUTE_CAP=70` (PTX for compute 7.0, JIT-compiled on
+   the 5060 Ti), the same bitwise identity with v0.2.
+3. **Speed**: `compare.py` on the RTX 5060 Ti, v0.3-L1 against the v0.2 binary in alternated
+   rounds of one session (the v0.2 binary kept under another name); nsys kernel time per call.
+4. **Profile**: Nsight Compute `--set full` on one forward launch, as FA5.
+
+**Predictions.**
+- **P1:** O and L bitwise identical to v0.2 on every input of step 1, and on the fallback build.
+- **P2:** forward kernel time per call **−15 to −30 %** against v0.2 in the same session.
+- **P3:** long-scoreboard stall from 2.25 to **≤ 0.8** warp-cycles per issued instruction; the
+  top stall becomes short scoreboard or barrier.
+- **P4:** shared memory per block unchanged (69,632 B); registers per thread ≤ 96 (v0.2: 80).
+- **P5:** the backward's kernel time unchanged within ±2 % (the backward is not touched).
+
+**Decision rule (fixed now).** P1 is a gate: any bit difference stops the lever until explained.
+If P2 shows ≥ 10 %, L1 is kept and L2 is registered on L1's profile. Below 5 %, L1 is reverted
+with a `MEASURED-REVERT` note and the profile is re-read before anything else is tried.
