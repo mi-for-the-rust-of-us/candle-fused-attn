@@ -22,7 +22,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA9](#fa9--lever-l1-for-the-backward-q-do-l-and-d-of-the-next-query-tile-loaded-during-this-one) | 2026-10-04 | does prefetching the next query tile speed the backward? | **all met**: backward −14.3 %, bitwise identical — **kept** |
 | [FA10](#fa10--design-l2-fewer-shared-loads-per-ffma) | 2026-10-04 | how to cut shared loads per FFMA on a 100 KB/SM card? | design; explicit fragment double-buffering **rejected** before building |
 | [FA11](#fa11--l2-forward-128-threads-8--4-outputs-per-thread) | 2026-10-04 | half the warps, twice the work per thread: faster or slower? | **slower** (+15.5 %): P1–P3 met, P4 missed — **rejected, reverted** |
-| [FA12](#fa12--v030-on-three-cards-rtx-5060-ti-rtx-4090-rtx-5090) | 2026-10-04 | does v0.3.0 hold on other cards, and in the whole training step? | registered (5060 Ti dry run done) |
+| [FA12](#fa12--v030-on-three-cards-rtx-5060-ti-rtx-4090-rtx-5090) | 2026-10-04 | does v0.3.0 hold on other cards, and in the whole training step? | P1, P3, P4 **met**; P2 half (5090 no-grad −19.7 %); P5 **missed** low (+1.8 % step) — release |
 
 ---
 
@@ -643,3 +643,42 @@ end to end. Bitwise identical; tests pass. v0.2.0 against v0.3, one session: for
 **−40.0 %**, backward **−16.4 %**, training call **−16.2 %** (the chained FA7 × FA9 estimate,
 −16 %, confirmed directly). Against SDPA: forward 0.895 against 0.978 ms, forward + backward net
 **3.982 against 4.963 ms (−20 %)**; in wall time, forward ×1.10 and net ×1.07 faster.
+
+### FA12 — RESULT (2026-10-04, ~10:20): bitwise identical on three cards; the attention gains hold; the whole training step gains less than predicted
+
+Reports (`bench/results/`): `2026-10-04-{rtx4090,rtx5090}-{compare-v0.3,ab-v0.2.0-vs-v0.3}.md`,
+`2026-10-04-rtx5090-trainer-ab-v0.2.0-vs-v0.3.md`; the 5060 Ti's are the dry run's. Rentals: askesis
+`rentals.md` (4090 $0.16, 5090 $0.20).
+
+| v0.2.0 → v0.3, alternated (`ab.py`) | RTX 5060 Ti | RTX 4090 | RTX 5090 |
+|---|--:|--:|--:|
+| bitwise identity; CUDA tests | identical; pass | identical; pass | identical; pass |
+| forward kernel, no-grad calls | −40.0 % | −36.4 % | **−19.7 %** |
+| forward kernel, inside training calls | −43.6 % | −37.3 % | −38.5 % |
+| backward kernel | −16.4 % | −11.9 % | −8.9 % |
+| training call (forward + head + backward) | −16.2 % | −13.0 % | −12.8 % |
+
+| v0.3 against SDPA, same session (kernel ms) | RTX 5060 Ti | RTX 4090 | RTX 5090 |
+|---|--:|--:|--:|
+| forward: ours / SDPA | **0.895** / 0.978 | **0.254** / 0.334 | **0.192** / 0.243 |
+| forward + backward net: ours / SDPA | **3.982** / 4.963 | **1.200** / 1.559 | **0.891** / 1.104 |
+| wall time, net (decision rule) | ours ×1.07 | **SDPA ×1.19** | ours ×1.11 |
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1 | bitwise identical; tests pass | all three cards | met |
+| P2 | forward −30 to −45 % | 4090 −36.4 %; 5090 −19.7 % in no-grad calls, −38.5 % inside training calls | half met |
+| P3 | backward −8 to −20 % | 4090 −11.9 %; 5090 −8.9 % | met |
+| P4 | forward and net kernel time below SDPA's | met on all three cards (wall time: SDPA still ahead net on the 4090) | met |
+| P5 | 5090 step −4 to −8 %; 0.85–0.90× PyTorch | **+1.8 % throughput** (65 against 66–67 ms); ≈ **0.90×** (0.92× with v0.2.0, same session) | **missed** low |
+
+**Reading.** The kernels' gains hold everywhere, bit for bit. Two things limit them. (1) On the
+5090, v0.2's forward is itself fast in back-to-back no-grad calls (0.237 against 0.308 ms inside
+training calls): the hypothesis is L2 residency — the 70.8 MB `qkv` fits the 5090's L2 (~96 MB)
+but not the 4090's (72 MB) or the 5060 Ti's (32 MB); the box blocked the GPU counters
+(`ERR_NVGPUCTRPERM`), so it is tested locally next (FA13), at a batch whose `qkv` fits 32 MB.
+(2) The whole training step gains +1.8 %, not 4–8 %: attention is a smaller share of the step than
+assumed, and the step already waits partly on the host (rentals.md, 2026-10-03). On the 4090,
+candle's glue around the op (separate small kernels and their launches) outweighs the kernels in
+wall time. **Decision (the registered rule): no card failed P1 — release 0.3.0 with every card's
+numbers.**

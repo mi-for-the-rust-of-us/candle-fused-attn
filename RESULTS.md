@@ -17,7 +17,8 @@ loss head. SDPA is PyTorch's fp32 `scaled_dot_product_attention` (memory-efficie
 
 | date | crate | forward | fwd + bwd | SDPA forward | SDPA fwd + bwd | report |
 |---|---|--:|--:|--:|--:|---|
-| 2026-10-04 | 0.3.0-dev, async forward loads (`aef44b9`) | **0.859** | **4.518** | 0.964 | 5.021 | [compare](bench/results/2026-10-04-rtx5060ti-compare-l1.md) |
+| 2026-10-04 | **0.3.0** (`32f5ec2`) | **0.895** | **3.982** | 0.978 | 4.963 | [compare](bench/results/2026-10-04-rtx5060ti-compare-v0.3.md) |
+| 2026-10-04 | 0.3.0-dev, async forward loads (`aef44b9`) | 0.859 | 4.518 | 0.964 | 5.021 | [compare](bench/results/2026-10-04-rtx5060ti-compare-l1.md) |
 | 2026-10-04 | 0.2.0 (baseline) | 1.387 | 4.874 | 0.949 | 4.708 | [compare](bench/results/2026-10-04-rtx5060ti-compare-v0.2-baseline.md) |
 | 2026-10-03 | 0.2 kernels (before release) | 1.419 | 4.973 | 0.945 | 4.814 | [compare](bench/results/2026-10-03-rtx5060ti-compare.md) |
 
@@ -25,6 +26,7 @@ Version against version, alternated in one session ([`bench/ab.py`](bench/ab.py)
 
 | date | change | forward kernel | backward kernel | training call | report |
 |---|---|--:|--:|--:|---|
+| 2026-10-04 | **0.2.0 → 0.3.0** | **−40.0 %** | **−16.4 %** | **−16.2 %** | [A/B](bench/results/2026-10-04-rtx5060ti-ab-v0.2.0-vs-v0.3.md) |
 | 2026-10-04 | 128 threads × 8 × 4 outputs (**rejected**) | +15.5 % | −1.8 % | +2.7 % | devlog FA11 |
 | 2026-10-04 | async, double-buffered backward loads | −0.1 % | **−14.3 %** | **−7.2 %** | [A/B](bench/results/2026-10-04-rtx5060ti-ab-l1-vs-fa9.md) |
 | 2026-10-04 | async forward loads | **−42.6 %** | +0.3 % | **−9.7 %** | [A/B](bench/results/2026-10-04-rtx5060ti-ab-v0.2-vs-l1.md) |
@@ -33,7 +35,20 @@ Version against version, alternated in one session ([`bench/ab.py`](bench/ab.py)
 
 | date | crate | forward | fwd + bwd | SDPA forward | SDPA fwd + bwd | report |
 |---|---|--:|--:|--:|--:|---|
-| 2026-10-03 | 0.2 kernels (before release) | 0.226 | **0.885** | **0.207** | 1.022 | [compare](bench/results/2026-10-03-rtx5090-compare.md) |
+| 2026-10-04 | **0.3.0** (`32f5ec2`) | **0.192** | **0.891** | 0.243 | 1.104 | [compare](bench/results/2026-10-04-rtx5090-compare-v0.3.md) |
+| 2026-10-03 | 0.2 kernels (before release) | 0.226 | 0.885 | 0.207 | 1.022 | [compare](bench/results/2026-10-03-rtx5090-compare.md) |
+
+0.2.0 → 0.3.0, alternated: forward kernel −19.7 % in no-grad calls, −38.5 % inside training calls;
+backward −8.9 %; training call −12.8 % ([A/B](bench/results/2026-10-04-rtx5090-ab-v0.2.0-vs-v0.3.md)).
+
+### RTX 4090
+
+| date | crate | forward | fwd + bwd | SDPA forward | SDPA fwd + bwd | report |
+|---|---|--:|--:|--:|--:|---|
+| 2026-10-04 | **0.3.0** (`32f5ec2`) | **0.254** | **1.200** | 0.334 | 1.559 | [compare](bench/results/2026-10-04-rtx4090-compare-v0.3.md) |
+
+0.2.0 → 0.3.0, alternated: forward kernel −36.4 %; backward −11.9 %; training call −13.0 %
+([A/B](bench/results/2026-10-04-rtx4090-ab-v0.2.0-vs-v0.3.md)).
 
 ### Accuracy
 
@@ -55,7 +70,8 @@ Summary with sources: [trainer history](bench/results/2026-10-04-trainer-vs-pyto
 
 | date | card, batch | ratio | what changed |
 |---|---|--:|---|
-| 2026-10-03 | RTX 5090, 128 | **0.93×** | candle's index_add and fused GELU backward |
+| 2026-10-04 | RTX 5090, 128 | **0.90×** | this crate's 0.3.0 (+1.8 % throughput against 0.2.0, [A/B](bench/results/2026-10-04-rtx5090-trainer-ab-v0.2.0-vs-v0.3.md)) |
+| 2026-10-03 | RTX 5090, 128 | 0.93× | candle's index_add and fused GELU backward |
 | 2026-10-03 | RTX 5090, 128 | 1.01× | this crate's one-kernel backward; LayerNorm statistics |
 | 2026-10-02 | RTX 5090, 128 | 1.19× | this crate, v0.1 |
 | 2026-10-02 | RTX 5090, 128 | 1.32× | composed attention |
