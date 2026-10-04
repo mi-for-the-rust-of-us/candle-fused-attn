@@ -70,7 +70,9 @@ worth its training gain on mid-range cards only, and its priority is decided on 
 **The levers, as measured.** Today's forward block holds Q, K, V and P tiles of 64 rows × 68
 floats in **69,632 bytes of dynamic shared memory**, which fits **one block per SM** on the 5060
 Ti; 8 warps; each thread a 4×4 register tile. SDPA runs 4 warps × 3 blocks per SM, with larger
-per-thread tiles. Candidates: smaller tiles, or K/V tiles shared across query rows, to fit 2–3
+per-thread tiles, and it runs its matmuls on tensor cores as 3xTF32 where this crate uses plain
+FFMA; which of the two differences dominates is not measured yet, and the first profile of the
+forward should say. Candidates: smaller tiles, or K/V tiles shared across query rows, to fit 2–3
 blocks per SM; an 8×8 (or 4×8) per-thread tile; fewer warps per block. Each is a change to
 `TWIN`-annotated constants on both sides (`src/cuda.rs`, `kernels/fused_attn.cu`).
 

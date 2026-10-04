@@ -1,5 +1,13 @@
 # candle-fused-attn
 
+[![CI](https://github.com/mi-for-the-rust-of-us/candle-fused-attn/actions/workflows/ci.yml/badge.svg)](https://github.com/mi-for-the-rust-of-us/candle-fused-attn/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/candle-fused-attn.svg)](https://crates.io/crates/candle-fused-attn)
+[![docs.rs](https://docs.rs/candle-fused-attn/badge.svg)](https://docs.rs/candle-fused-attn)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org)
+[![license](https://img.shields.io/crates/l/candle-fused-attn.svg)](https://github.com/mi-for-the-rust-of-us/candle-fused-attn#license)
+[![unsafe: deny](https://img.shields.io/badge/unsafe-deny_(CUDA_launches_only)-blue.svg)](https://github.com/rust-secure-code/safety-dance/)
+[![NVIDIA](https://img.shields.io/badge/NVIDIA-CUDA_sm__70%2B-76B900.svg?logo=nvidia&logoColor=white)](#limits)
+
 > **ἐξ ἐλαχίστου πλεῖστον** · *ex elakhístou pleîston* · from the least, the most<br>
 > **ἐξ ὀλίγων πολλά** · *ex olígōn pollá* · from few things, many
 
@@ -54,31 +62,40 @@ forward and backward, single-head).
 
 ## Measured
 
-v0.2 at b 64 · h 6 · s 240 · d 64, non-causal. `bench/compare.py`: one unit for every candidate (fused qkv projection → merged output, backward
-via `sum(o ∘ dout)`), shared seeded inputs, kernel time per call by nsys. Reports, committed:
+v0.2, at b 64 · h 6 · s 240 · d 64, non-causal, with `bench/compare.py`: one unit for every
+candidate (fused qkv projection → merged output), shared seeded inputs, kernel time per call by
+nsys. *Forward* is a no-grad call; *forward + backward* is a training call (backward via
+`sum(o ∘ dout)`), net of that loss head. Reports, committed:
 [RTX 5090](bench/results/2026-10-03-rtx5090-compare.md) (torch 2.14),
 [RTX 5060 Ti](bench/results/2026-10-03-rtx5060ti-compare.md) (torch 2.10), both 2026-10-03.
 
-| kernel ms per call | forward (no-grad call) | forward + backward, net of the loss head |
-|---|---|---|
-| **RTX 5090**: this crate | 0.226 | **0.885** |
-| RTX 5090: PyTorch SDPA (memory-efficient, CUTLASS) | **0.207** | 1.022 |
-| RTX 5090: PyTorch, composed (matmul, softmax, matmul) | 0.443 | 1.310 |
-| **RTX 5060 Ti**: this crate | 1.419 | 4.973 |
-| RTX 5060 Ti: PyTorch SDPA | **0.945** | **4.814** |
-| RTX 5060 Ti: PyTorch, composed | 1.843 | 5.760 |
+Kernel time per call, in **milliseconds**; lower is better, **bold** = fastest.
+
+| ![RTX 5090](https://img.shields.io/badge/RTX_5090-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
+|---|--:|--:|
+| **candle-fused-attn** | 0.226 | **0.885** |
+| PyTorch SDPA (memory-efficient, CUTLASS) | **0.207** | 1.022 |
+| PyTorch, composed (matmul, softmax, matmul) | 0.443 | 1.310 |
+
+| ![RTX 5060 Ti](https://img.shields.io/badge/RTX_5060_Ti-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
+|---|--:|--:|
+| **candle-fused-attn** | 1.419 | 4.973 |
+| PyTorch SDPA (memory-efficient, CUTLASS) | **0.945** | **4.814** |
+| PyTorch, composed (matmul, softmax, matmul) | 1.843 | 5.760 |
 
 The backward kernels are faster than SDPA's on both cards (5090: 0.597 against 0.767 ms;
 5060 Ti: 2.93 against 3.66 ms, SDPA's own gradient concatenation included). The forward is not:
-SDPA runs its matmuls on tensor cores as 3xTF32 (fp32-accurate by splitting), where this crate
-uses plain FFMA, a cost of ×1.09 on the 5090 and ×1.5 on the 5060 Ti — enough on the 5060 Ti for
-SDPA to stay ahead forward + backward.
+×1.09 SDPA's time on the 5090, ×1.5 on the 5060 Ti — enough on the 5060 Ti for SDPA to stay
+ahead forward + backward. Two differences could explain it, and which one dominates is not
+measured yet: SDPA runs its matmuls on tensor cores as 3xTF32 (fp32-accurate by splitting) where
+this crate uses plain FFMA, and it fits three 4-warp blocks per SM where this crate fits one
+8-warp block. A faster forward is the next release's work ([ROADMAP.md](ROADMAP.md)).
 
 **Accuracy** against an fp64 reference (normwise relative error; the same on both cards):
 
 | | O | dQ | dK | dV |
-|---|---|---|---|---|
-| **this crate** | 3.9e-7 | 4.0e-7 | 4.6e-7 | 4.4e-7 |
+|---|--:|--:|--:|--:|
+| **candle-fused-attn** | 3.9e-7 | 4.0e-7 | 4.6e-7 | 4.4e-7 |
 | PyTorch SDPA (memory-efficient) | 5.7e-7 | 8.0e-7 | 8.0e-7 | 6.2e-7 |
 | PyTorch, composed | 3.9e-7 | 4.1e-7 | 4.1e-7 | 3.9e-7 |
 | fp64 rounded to fp32 (the floor) | 2.5e-8 | 2.5e-8 | 2.5e-8 | 2.5e-8 |
@@ -105,7 +122,7 @@ use it. Its code is [`examples/tutorial.rs`](examples/tutorial.rs), which CI run
 ```bash
 cargo test                     # the CPU path: no GPU, no CUDA toolkit
 cargo test --features cuda     # the kernels: CUDA vs CPU within the measured band, bitwise reruns
-bash scripts/ci-local.sh       # before pushing: CI and the release's checks, locally (--no-cuda to skip the GPU)
+bash scripts/ci-local.sh       # before pushing: CI + the release's checks (--no-cuda: no GPU)
 ```
 
 The `cuda` feature compiles the kernels with `nvcc` at build time (the CUDA toolkit must be
@@ -115,7 +132,7 @@ stream.
 
 ```bash
 cargo run --release --features cuda --example bench [b h s]   # quick wall-time check
-python bench/compare.py run    # vs PyTorch: speed AND accuracy (needs torch, safetensors, nsys optional)
+python bench/compare.py run    # vs PyTorch: speed AND accuracy (torch, safetensors; nsys optional)
 ```
 
 ## Used by
@@ -143,7 +160,8 @@ at your option.
   designed to improve AI coding accuracy — with Grit-FA rules for the CUDA kernels (cited C++
   references, constants twinned across Rust and CUDA, a stated summation order for every reduction)
   and for published claims.
-- Plans: [ROADMAP.md](ROADMAP.md) (next: a faster forward); how a release is cut: [CLAUDE.md](CLAUDE.md).
+- Plans: [ROADMAP.md](ROADMAP.md) (next: a faster forward); how a release is cut:
+  [CLAUDE.md](CLAUDE.md).
 - CI runs the CPU path on the MSRV (1.88) and stable, rustdoc with private items and cargo-deny.
   The CUDA tests need a GPU and run locally before each release. Releases are published from
   GitHub Actions through crates.io Trusted Publishing, after the maintainer's approval.
