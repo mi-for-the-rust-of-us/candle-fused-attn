@@ -34,8 +34,6 @@ const THREADS: u32 = 256; // TWIN: kernels/fused_attn.cu:NT
 // CAST: u32 → usize, 256 / 32 = 8 fits any usize
 #[allow(clippy::as_conversions)]
 const WARPS: usize = (THREADS / 32) as usize;
-/// Threads per forward block, as `FW_NT` in the kernels (devlog FA11: 8 × 4 outputs each).
-const FWD_THREADS: u32 = 128; // TWIN: kernels/fused_attn.cu:FW_NT
 /// Query rows per forward block, as `FW_QRYS` in the kernels.
 const FWD_QUERIES: usize = 64; // TWIN: kernels/fused_attn.cu:FW_QRYS
 /// Keys per forward tile, as `FW_KEYS` in the kernels.
@@ -94,12 +92,12 @@ fn check_head_dim(d: usize) -> Result<()> {
     }
 }
 
-/// A grid of `ceil(s / rows) × h × b` blocks of `threads` threads with `smem` bytes of shared
-/// memory, `rows` the sequence positions one block owns.
-fn grid((b, h, s, _): Dims, rows: usize, threads: u32, smem: u32) -> Result<LaunchConfig> {
+/// A grid of `ceil(s / rows) × h × b` blocks of [`THREADS`] with `smem` bytes of shared memory,
+/// `rows` the sequence positions one block owns.
+fn grid((b, h, s, _): Dims, rows: usize, smem: u32) -> Result<LaunchConfig> {
     Ok(LaunchConfig {
         grid_dim: (u32_of(s.div_ceil(rows))?, u32_of(h)?, u32_of(b)?),
-        block_dim: (threads, 1, 1),
+        block_dim: (THREADS, 1, 1),
         shared_mem_bytes: smem,
     })
 }
@@ -182,7 +180,7 @@ pub fn forward(
         .arg(&v2);
     // SAFETY: reads q, k, v through their strides inside their storages (shape-checked by the
     // caller), writes all of `o` and `lse`.
-    unsafe { builder.launch(grid(dims, FWD_QUERIES, FWD_THREADS, FWD_SMEM)?) }.w()?;
+    unsafe { builder.launch(grid(dims, FWD_QUERIES, FWD_SMEM)?) }.w()?;
     Ok((o, lse))
 }
 
@@ -257,7 +255,7 @@ pub fn backward(
     // SAFETY: reads q, k, v, dO through their (float4-aligned) strides, L and D; writes all of
     // dqkv (dK, dV by the owning key block; dQ by key block 0, then read-modify-written in
     // key-block order under the turn counters, which it also advances).
-    unsafe { builder.launch(grid(dims, BWD_KEYS, THREADS, BWD_SMEM)?) }.w()?;
+    unsafe { builder.launch(grid(dims, BWD_KEYS, BWD_SMEM)?) }.w()?;
     Ok(dqkv)
 }
 
