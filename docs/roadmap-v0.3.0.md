@@ -84,3 +84,20 @@ Then one nsys capture per binary (`--trace=cuda`, `--force-overwrite=true`), and
 - If the fused binary is faster (its worst round below the composed binary's best), propose
   running local evaluations on it — a rounding-level change of the readouts, to be disclosed in
   askesis's records before it is adopted.
+
+### 0a — RESULT (2026-10-04, 07:24): the baseline reproduces 2026-10-03; prediction met
+
+`compare.py` with the Machine section, crate `0ed05e7` (clean), RTX 5060 Ti (driver 610.88, WDDM;
+nvcc 13.1; Ryzen 9 5950X), nsys 2025.5.2; 2 min 28 s.
+Report: [`bench/results/2026-10-04-rtx5060ti-compare-v0.2-baseline.md`](../bench/results/2026-10-04-rtx5060ti-compare-v0.2-baseline.md).
+
+| kernel time per call (ms) | 2026-10-03 | **2026-10-04** | change |
+|---|--:|--:|--:|
+| candle-fused-attn, forward | 1.419 | **1.387** | −2.3 % |
+| candle-fused-attn, forward + backward (net) | 4.973 | **4.874** | −2.0 % |
+| SDPA (memory-efficient), forward | 0.945 | **0.949** | +0.4 % |
+| SDPA, forward + backward (net) | 4.814 | **4.708** | −2.2 % |
+
+All four within the registered ±5 %; the forward ratio is ×1.46 (registered ×1.50 ± 0.10).
+Accuracy against fp64 and the bitwise reruns are identical to 2026-10-03's. The card ran
+P1 at 2,775 MHz, 32 → 43 °C, across the timed rounds. **This report is the baseline.**
