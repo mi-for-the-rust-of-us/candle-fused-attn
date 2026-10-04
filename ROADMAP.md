@@ -36,7 +36,7 @@ computes dK, dV and a dQ partial in one pass, the dQ partials added in key-block
   128-thread remedy was measured slower (devlog FA11: fewer warps cost more than the loads saved).
   The remaining route keeps 256 threads with larger tiles, which needs swizzled, unpadded shared
   memory to fit 99 KB per block (FA10).
-- **The L2 question, settled.** FA13 found the 5090's smaller no-grad forward gain follows L2
+- **The L2 question, to settle.** FA13 found the 5090's smaller no-grad forward gain follows L2
   capacity; a profiler-free test (flush L2 between calls) would confirm it.
 - **The training step's other costs.** The canvas step gains +1.8 % for −13 % on the attention
   call: the step is partly host-bound — candle and candle-mi territory, not this crate's.
@@ -49,6 +49,9 @@ computes dK, dV and a dQ partial in one pass, the dQ partials added in key-block
   so the kernels can be templated on them.
 - **Upstream to candle.** The plan since the start (crate first, upstream second): candle has no
   fused attention that trains, and none in fp32 on CUDA. kaio-candle 0.2.0 is the prior art to cite.
+  A first, smaller report stands apart from our kernels: built with CUDA 13.1 for compute
+  capability 7.5, candle-kernels' `compatibility.cuh` redefines `__hmax_nan` / `__hmin_nan`, which
+  CUDA 13.1's `cuda_fp16.hpp` now provides, so candle itself does not compile there (devlog FA7).
 
 ---
 
