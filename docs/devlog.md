@@ -20,6 +20,8 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA7](#fa7--lever-l1-asynchronous-kv-loads-overlapped-with-the-math) | 2026-10-04 | does overlapping the K/V loads with the math close the gap? | P1, P3, P5 **met**; P2 **missed high** (−42.6 %); P4 half missed (114 registers) — **kept** |
 | [FA8](#fa8--the-backward-kernel-profiled-before-any-change) | 2026-10-04 | where does the backward kernel's time go? | P1, P2, P4, P5 **met**; P3 **missed** narrowly (barrier 4th) |
 | [FA9](#fa9--lever-l1-for-the-backward-q-do-l-and-d-of-the-next-query-tile-loaded-during-this-one) | 2026-10-04 | does prefetching the next query tile speed the backward? | **all met**: backward −14.3 %, bitwise identical — **kept** |
+| [FA10](#fa10--design-l2-fewer-shared-loads-per-ffma) | 2026-10-04 | how to cut shared loads per FFMA on a 100 KB/SM card? | design; explicit fragment double-buffering **rejected** before building |
+| [FA11](#fa11--l2-forward-128-threads-8--4-outputs-per-thread) | 2026-10-04 | half the warps, twice the work per thread: faster or slower? | registered |
 
 ---
 
@@ -500,3 +502,81 @@ larger register tiles, is next, designed for both kernels**.
 **Procedure note.** The build of FA9 overwrote the L1 `compare.exe` that the A/B needed as its
 reference; L1 was rebuilt from its commit and checked bitwise identical before use. Binaries are
 not identified by md5 across links on Windows (the linker stamps a time in every executable).
+
+---
+
+## FA10 — design: L2, fewer shared loads per FFMA
+
+*2026-10-04, after FA9; before any code. Both kernels' top stall is now short scoreboard (waiting
+on shared-memory loads): forward 1.07, backward 1.28 warp-cycles per issued instruction.*
+
+**Rejected before building: explicit register-fragment double-buffering.** CUTLASS's pipelined
+main loop (torch 2.10 headers, `mem_eff_attention/gemm/custom_mma_pipelined.h`, lines 294–370:
+`warp_frag_A[2]`, the k + 1 fragments loaded before the k-th `warp_mma`) is the textbook answer
+to shared-load latency. But nvcc already does it for us: in the SASS of `487b4f2` (`ptxas
+-arch=sm_120a`), the distance from each `LDS` to the first instruction that reads its result is
+a **median of 29 instructions in the forward and 36 in the backward**; only 12 % and 4 % of the
+loads are consumed within 8 instructions. An explicit version would move little; not built.
+
+**Counted, not guessed: shared loads per FFMA.** Per thread and tile (`LDS.128` instructions;
+these counts reproduce FA5's and FA8's totals exactly: 12.58 M and 40.89 M):
+
+| kernel, phase | today (256 threads) | LDS / FFMA |
+|---|---|--:|
+| forward, S = QKᵀ: 4 rows × 4 keys | 16 steps × (4 Q + 4 K) = 128 LDS, 1,024 FFMA | 1 / 8 |
+| forward, O += PV: 4 rows × 4 dims | 16 × (4 P + 4 V) = 128 LDS, 1,024 FFMA | 1 / 8 |
+| backward, S and dP: 2 rows × 4 keys | 16 × (2 Q + 2 dO + 4 K + 4 V) = 192 LDS, 1,024 FFMA | 1 / 5.3 |
+| backward, dV and dK: 4 keys × 4 dims | 32 × (P + dS + dO + Q) = 128 LDS, 1,024 FFMA | 1 / 8 |
+| backward, dQ partial: 2 rows × 4 dims | 16 × (2 dS + 4 K) = 96 LDS, 512 FFMA | 1 / 5.3 |
+
+**The constraint.** Outputs per thread = tile area ÷ threads. At today's tiles and 256 threads,
+that is 16 per thread (4 × 4). Larger tiles do not fit the 99 KB a block may hold: a forward with
+128-query tiles needs Q, K, V, P = (128 + 64 + 64 + 128) rows × 68 floats ≈ 104 KB; a backward
+with 64-query tiles, ≈ 139 KB with FA9's double buffers (≈ 104 KB without). So **more work per
+thread at the same shared memory means fewer threads: 128 threads, 4 warps per SM instead of 8**
+— the configuration SDPA's backward runs in (FA8). Fewer warps hide latency less; more
+independent FFMAs per thread hide it more. Which wins on this card is not predictable from
+counts; it is measured, on the simpler kernel first.
+
+| candidate | threads, outputs per thread | shared loads per block and tile | warps per SM |
+|---|---|--:|--:|
+| forward today | 256, 4 × 4 | 65,536 | 8 |
+| **forward L2 (FA11)**: rows 8·ty … + 8, keys / dims as today | 128, **8 × 4** | **49,152 (−25 %)** | 4 |
+| backward today | 256 | 106,496 | 8 |
+| backward L2 (later, if FA11 wins): S, dP 4 × 4; dK, dV 8 × 4; dQ 4 × 4 | 128 | 73,728 (−31 %) | 4 |
+
+**Correction to FA6.** FA6 held L2 to the accuracy bar, assuming larger register tiles regroup the
+sums. They need not: each output's accumulation keeps its order (over the head dimension in
+phase 1, over keys in phase 2, over queries for dK and dV, over keys for dQ, and the softmax's
+16-lane butterfly is unchanged) — only *which thread* computes it changes. **The bitwise gate
+applies to L2.**
+
+
+---
+
+## FA11 — L2, forward: 128 threads, 8 × 4 outputs per thread
+
+*Registered 2026-10-04, before any code.*
+
+**Change.** `fattn_fwd_f32_d64` only, launched with 128 threads (`THREADS`/`NT` split: the
+forward's own `FW_THREADS` = 128, a new `TWIN`; the backward and the D kernel keep 256). Thread
+(ty = tid / 16, 0–7; tx = tid % 16): phase 1 computes S for rows 8·ty … + 8 and keys tx + 16·jj
+(jj 0–3); phase 2 accumulates O for the same 8 rows and dims 4·tx … + 4. Same tiles (64 × 64),
+same shared memory (69,632 B), same L1 load schedule (the tile loops stride by 128 threads), same
+per-output order everywhere: the dot products over the head dimension, the 16-lane row max / sum
+butterflies, PV over keys in order.
+
+**Predictions.**
+- **P1 (gate):** O and dqkv bitwise identical to v0.2 on `bench/bitwise.py`'s 6 shapes, native
+  and forced-fallback builds.
+- **P2:** registers per thread 140–220; shared loads per launch −25 % (12.58 M → 9.44 M
+  warp-level); achieved occupancy ≈ 8.3 % (4 warps per SM).
+- **P3:** short-scoreboard stall per issued instruction down from 1.07; "no eligible" (no warp
+  ready to issue) up from FA7's level — the trade made visible.
+- **P4:** forward kernel time against FA9's build, alternated (`bench/ab.py`): **between −15 % and
+  +15 %** — the honest range for a trade the counts cannot settle; the backward unchanged ±2 %.
+
+**Decision rule (fixed now).** P1 is a gate. Faster by ≥ 5 % → kept, and the backward's L2 is
+registered on the same pattern. Within ±5 % or slower → reverted (`MEASURED-REVERT`), recorded as
+rejected with its numbers, and the next design looks at larger tiles with swizzled (unpadded)
+shared memory instead, which keeps 8 warps per SM.
