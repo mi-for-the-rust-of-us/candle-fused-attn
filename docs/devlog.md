@@ -22,6 +22,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA9](#fa9--lever-l1-for-the-backward-q-do-l-and-d-of-the-next-query-tile-loaded-during-this-one) | 2026-10-04 | does prefetching the next query tile speed the backward? | **all met**: backward −14.3 %, bitwise identical — **kept** |
 | [FA10](#fa10--design-l2-fewer-shared-loads-per-ffma) | 2026-10-04 | how to cut shared loads per FFMA on a 100 KB/SM card? | design; explicit fragment double-buffering **rejected** before building |
 | [FA11](#fa11--l2-forward-128-threads-8--4-outputs-per-thread) | 2026-10-04 | half the warps, twice the work per thread: faster or slower? | **slower** (+15.5 %): P1–P3 met, P4 missed — **rejected, reverted** |
+| [FA12](#fa12--v030-on-three-cards-rtx-5060-ti-rtx-4090-rtx-5090) | 2026-10-04 | does v0.3.0 hold on other cards, and in the whole training step? | registered (5060 Ti dry run done) |
 
 ---
 
@@ -608,3 +609,37 @@ Recorded so that nobody re-proposes it blind: the kernel's header now names the 
 number. **Next design** (FA10's fallback): larger tiles at 256 threads, keeping 8 warps per SM,
 which needs swizzled, unpadded shared memory to fit the 99 KB a block may hold — a larger change,
 to be weighed against what the release needs (see the roadmap).
+
+---
+
+## FA12 — v0.3.0 on three cards: RTX 5060 Ti, RTX 4090, RTX 5090
+
+*Registered 2026-10-04, before the rentals; the local dry run of the procedure is reported with it.*
+
+**Protocol.** `bench/box.sh <label>` on each machine, from a clone at the same commit: records the
+machine; builds v0.2.0 (its tag, in a worktree) and this checkout; the bitwise gate between them;
+the CUDA tests; `compare.py` (this checkout against PyTorch); `bench/ab.py` (v0.2.0 against this
+checkout, alternated). On the RTX 5090 only, also the canvas training step through candle-mi:
+candle-fused-attn 0.2.0 against this checkout, alternated, and PyTorch's reference step, on one
+box (askesis's `torch_vs_candle.sh` with `CANVAS_BIN`).
+
+**Predictions (both rented cards unless said).**
+- **P1:** bitwise identity, v0.2.0 against this checkout, on each card; the CUDA tests pass.
+- **P2:** forward kernel, v0.3 against v0.2.0: **−30 to −45 %**.
+- **P3:** backward kernel: **−8 to −20 %**.
+- **P4:** against SDPA in the same session: our forward kernel ≤ SDPA's (on the 5090 it was ×1.09
+  slower with v0.2); forward + backward net below SDPA's.
+- **P5 (5090):** the whole training step at batch 128, v0.3 against 0.2.0: **−4 to −8 %**
+  (attention ≈ a quarter of the step: ≈ 8 ms forward and 8 ms backward of ≈ 67 ms, cut ≈ 40 % and
+  ≈ 15 %); against PyTorch, **0.85× to 0.90×** (2026-10-03: 0.93×).
+
+**Decision rule.** A card failing P1 stops the release until explained. Otherwise 0.3.0 is
+released with every card's numbers, whatever P2–P5 read, and the README and `RESULTS.md` carry
+them.
+
+**Local dry run (RTX 5060 Ti, 2026-10-04 11:14–11:20, 5 min 48 s; reports
+`bench/results/2026-10-04-rtx5060ti-{compare-v0.3,ab-v0.2.0-vs-v0.3}.md`).** The procedure runs
+end to end. Bitwise identical; tests pass. v0.2.0 against v0.3, one session: forward kernel
+**−40.0 %**, backward **−16.4 %**, training call **−16.2 %** (the chained FA7 × FA9 estimate,
+−16 %, confirmed directly). Against SDPA: forward 0.895 against 0.978 ms, forward + backward net
+**3.982 against 4.963 ms (−20 %)**; in wall time, forward ×1.10 and net ×1.07 faster.
