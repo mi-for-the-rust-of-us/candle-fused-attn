@@ -101,3 +101,28 @@ Report: [`bench/results/2026-10-04-rtx5060ti-compare-v0.2-baseline.md`](../bench
 All four within the registered ±5 %; the forward ratio is ×1.46 (registered ×1.50 ± 0.10).
 Accuracy against fp64 and the bitwise reruns are identical to 2026-10-03's. The card ran
 P1 at 2,775 MHz, 32 → 43 °C, across the timed rounds. **This report is the baseline.**
+
+### 0b — RESULT (2026-10-04, 07:28): P1 missed low (18.5 %), P2 and P3 met; both decision rules fire
+
+Report: [`bench/results/2026-10-04-rtx5060ti-canvas-eval.md`](../bench/results/2026-10-04-rtx5060ti-canvas-eval.md)
+(~2.5 min of GPU, as priced).
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1: fused forward's share of the evaluation's kernel time | 20–30 % | **18.5 %** (2.666 of 14.402 s) | **missed, low** |
+| P2: fused evaluation faster (decode wall) | 5–15 % | **9.4 %** (15.67 vs 17.29–17.30 s) | met |
+| P3: same validity within ±3 | ±3 | **154 = 154; the 200 plans identical** | met |
+
+**Why P1 missed.** The linear layers' cuBLAS sgemm is 63.6 % of the fused evaluation (9.16 s);
+the estimate assumed ~15 TFLOPS of sgemm where the card delivered less. The attention per call,
+2.20 ms averaged over the batches of 128 and 72, was close to the estimate.
+
+**Decision rules (as registered).**
+- Share ≥ 15 % → **v0.3.0 pays on evaluations too**: at SDPA's forward speed (÷1.5), 2.67 s →
+  ~1.78 s, about **−6 % of the evaluation's kernel time**, on top of the training gain.
+- The fused binary is faster → **proposed: run local evaluations on the fused binary.** On this
+  checkpoint it changes no plan at all; the change must still be disclosed in askesis's records
+  before it is adopted (Éric's decision).
+
+**Observed, not registered.** The evaluation is GPU-bound (the wall gain, 1.63 s, equals the
+kernel gain, 1.61 s), and its largest consumer is the linear layers' sgemm — outside this crate.
