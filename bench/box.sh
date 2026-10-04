@@ -32,7 +32,10 @@ for n in "$(command -v nsys || true)" /usr/local/cuda/bin/nsys /opt/nvidia/nsigh
   if [ -n "$n" ] && "$n" --version > /dev/null 2>&1; then NSYS="$n"; break; fi
 done
 [ -n "$NSYS" ] || { echo "no working nsys (needed by bench/ab.py)" >&2; exit 1; }
-EXE=compare; [ "${OS:-}" = "Windows_NT" ] && EXE=compare.exe
+# The executable suffix, set by `if` (a failing `[ ]` inside `$( )` in an assignment exits under
+# `set -e`: that is how a first version died silently on Linux).
+SUF=""
+if [ "${OS:-}" = "Windows_NT" ]; then SUF=".exe"; fi
 
 # --- 1. The machine -------------------------------------------------------------------------------
 {
@@ -52,12 +55,12 @@ git rev-parse -q --verify v0.2.0 > /dev/null || git fetch --tags -q
 if [ ! -d target/v020-src ]; then git worktree add -q target/v020-src v0.2.0; fi
 log "build v0.2.0 (CPU)"
 (cd target/v020-src && cargo build -q --release --features cuda --example compare)
-cp -p "target/v020-src/target/release/examples/$EXE" "$out/compare-v020$([ "$EXE" = compare.exe ] && echo .exe)"
+cp -p "target/v020-src/target/release/examples/compare$SUF" "$out/compare-v020$SUF"
 log "build this checkout (CPU)"
 cargo build -q --release --features cuda --example compare
-cp -p "target/release/examples/$EXE" "$out/compare-head$([ "$EXE" = compare.exe ] && echo .exe)"
-A="$out/compare-v020$([ "$EXE" = compare.exe ] && echo .exe)"
-B="$out/compare-head$([ "$EXE" = compare.exe ] && echo .exe)"
+cp -p "target/release/examples/compare$SUF" "$out/compare-head$SUF"
+A="$out/compare-v020$SUF"
+B="$out/compare-head$SUF"
 
 # --- 3. The bitwise gate --------------------------------------------------------------------------
 log "bitwise gate (GPU)"
