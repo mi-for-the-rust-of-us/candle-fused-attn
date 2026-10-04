@@ -1,2 +1,5 @@
 # Shell scripts run on Linux runners: always LF, whatever core.autocrlf says on Windows.
 *.sh text eol=lf
+# GitHub's language bar files examples/ under documentation; these examples are code (CI runs the
+# tutorial, compare.rs produced every number in RESULTS.md), so count them as Rust.
+examples/*.rs linguist-documentation=false
