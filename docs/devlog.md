@@ -21,7 +21,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA8](#fa8--the-backward-kernel-profiled-before-any-change) | 2026-10-04 | where does the backward kernel's time go? | P1, P2, P4, P5 **met**; P3 **missed** narrowly (barrier 4th) |
 | [FA9](#fa9--lever-l1-for-the-backward-q-do-l-and-d-of-the-next-query-tile-loaded-during-this-one) | 2026-10-04 | does prefetching the next query tile speed the backward? | **all met**: backward −14.3 %, bitwise identical — **kept** |
 | [FA10](#fa10--design-l2-fewer-shared-loads-per-ffma) | 2026-10-04 | how to cut shared loads per FFMA on a 100 KB/SM card? | design; explicit fragment double-buffering **rejected** before building |
-| [FA11](#fa11--l2-forward-128-threads-8--4-outputs-per-thread) | 2026-10-04 | half the warps, twice the work per thread: faster or slower? | registered |
+| [FA11](#fa11--l2-forward-128-threads-8--4-outputs-per-thread) | 2026-10-04 | half the warps, twice the work per thread: faster or slower? | **slower** (+15.5 %): P1–P3 met, P4 missed — **rejected, reverted** |
 
 ---
 
@@ -580,3 +580,31 @@ butterflies, PV over keys in order.
 registered on the same pattern. Within ±5 % or slower → reverted (`MEASURED-REVERT`), recorded as
 rejected with its numbers, and the next design looks at larger tiles with swizzled (unpadded)
 shared memory instead, which keeps 8 warps per SM.
+
+### FA11 — RESULT (2026-10-04, ~10:50): bitwise identical, 25 % fewer shared loads, and 15.5 % slower — rejected
+
+Code as measured: `c1dfba2`; reverted by `dbf623a` (sources identical to FA9's `487b4f2`).
+Profile: `profiles/2026-10-04-rtx5060ti-fwd-candle-fused-attn-fa11-rejected.ncu-repz`.
+A/B against FA9's binary, alternated (`bench/ab.py`, `target/ab/fa11`).
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1: bitwise identity | native and fallback | **identical** (6 shapes × 2 entry points; both builds) | met |
+| P2: registers; shared loads; occupancy | 140–220; −25 % (9.44 M); ≈ 8.3 % | 168; **9,437,184** (−25.0 %); 8.35 % | met |
+| P3: short scoreboard down; "no eligible" up | | short scoreboard 1.07 → **0.42**; no eligible 47.8 → **57.9 %** | met |
+| P4: forward kernel time vs FA9 | −15 % to +15 % | **+15.5 %** (0.860 → 0.994 ms); training call +2.7 % | **missed** (slower) |
+
+| forward, under Nsight Compute | FA9 (256 threads, 4 × 4) | FA11 (128 threads, 8 × 4) |
+|---|--:|--:|
+| warp cycles per issued instruction | 3.82 | **2.35** |
+| issue slots busy | **51.2 %** | 41.5 % |
+| no eligible warp | 47.8 % | 57.9 % |
+| FMA pipe; LSU pipe | 38.0 %; 44.2 % | 32.2 %; 29.2 % |
+
+**Reading.** Each warp got better — 38 % fewer cycles between its instructions — but with one
+warp per scheduler there is nothing to issue while that warp waits, so the schedulers idle more.
+On this card, at this shape, **8 warps per SM are worth more than 25 % of the shared loads**.
+Recorded so that nobody re-proposes it blind: the kernel's header now names the variant and its
+number. **Next design** (FA10's fallback): larger tiles at 256 threads, keeping 8 warps per SM,
+which needs swizzled, unpadded shared memory to fit the 99 KB a block may hold — a larger change,
+to be weighed against what the release needs (see the roadmap).

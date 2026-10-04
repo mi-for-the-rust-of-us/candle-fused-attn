@@ -395,6 +395,9 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
 //            reduced over the 16 lanes sharing ty; P goes to shared memory.
 //   phase 2: the SAME thread owns rows 4ty .. +4 and dims 4tx .. +4 of the O accumulator, so the
 //            rescale by exp(m_old - m_new) and the final 1/l never cross threads.
+//   Measured and rejected (devlog FA11): 128 threads with 8 x 4 outputs each -- 25 % fewer shared
+//   loads, bit-identical, but +15.5 % kernel time on an RTX 5060 Ti (4 warps per SM leave the
+//   schedulers without a ready warp 58 % of the time).
 // Out: o [b, s, h, d] (the merge-heads layout) and lse [b, h, s], the backward's saved state.
 // Loads overlap the math (devlog FA7): V(n) travels while phase 1 computes S from K(n), and
 // K(n + 1) travels while phase 2 consumes V(n); one K and one V buffer suffice, because each is
