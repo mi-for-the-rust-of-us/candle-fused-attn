@@ -14,84 +14,32 @@ comparable across seeds, cards and days. Everything below is ranked by what that
 
 ## Current state
 
-**v0.2.0** shipped 2026-10-03. *The backward in one kernel, still deterministic.* Each key block
-computes dK, dV and a dQ partial in one pass (5 matmuls per tile instead of 7), and the key blocks
-add their dQ partials in key-block order under per-tile turn counters, so reruns are
-bit-identical. The backward kernels now beat PyTorch's fp32 SDPA (memory-efficient, CUTLASS)
-on both cards measured; the forward does not. Kernel time per call at the canvas trainer's shape,
-b 64 · h 6 · s 240 · d 64, non-causal (`bench/compare.py`, nsys):
+**v0.3.0** shipped 2026-10-04. *Loads overlap the math, outputs unchanged bit for bit.* Both
+kernels copy their next tiles with asynchronous loads (`cp.async`) while the current tile
+computes — FlashAttention-2's load schedule in the forward, double-buffered query tiles in the
+backward. Measured on three cards, 0.2.0 against 0.3.0 alternated in one session: forward kernel
+−37 to −44 % inside training calls, backward −9 to −16 %, an attention training call −13 to −16 %;
+against PyTorch's fp32 SDPA in the same session, forward and forward + backward are faster on the
+RTX 5060 Ti, 4090 and 5090 (kernel time). In the canvas training step on an RTX 5090: +1.8 %
+throughput, ≈ 0.90× PyTorch. Plan and measurements:
+[`docs/roadmap-v0.3.0.md`](docs/roadmap-v0.3.0.md), [`docs/devlog.md`](docs/devlog.md) FA1–FA13;
+every number: [`RESULTS.md`](RESULTS.md).
 
-| ms per call | forward | backward kernels | forward + backward, net |
-|---|---|---|---|
-| RTX 5090: this crate | 0.226 | **0.597** | **0.885** |
-| RTX 5090: SDPA | **0.207** | 0.767 | 1.022 |
-| RTX 5060 Ti: this crate | 1.419 | **2.93** | 4.973 |
-| RTX 5060 Ti: SDPA | **0.945** | 3.66 | **4.814** |
-
-Reports: [5090](bench/results/2026-10-03-rtx5090-compare.md),
-[5060 Ti](bench/results/2026-10-03-rtx5060ti-compare.md). In the trainer (6 layers, 384 wide,
-RTX 5090, batch 128, alternated rounds): composed attention 87 ms/step, v0.1 79, **v0.2 75**
-([report](bench/results/2026-10-03-rtx5090-trainer-ab.md)). Accuracy against fp64 is at the
-composed attention's level (dQ 4.0e-7 normwise) and better than SDPA's.
-
-The first downstream integration is candle-mi's `fused-attn` feature (in development, not yet in
-a candle-mi release): `OthelloGpt`'s attention through `fused_attention_qkv` at every layer with
-no attention-internal hook. Checked there against the PyTorch fixtures of an Othello world model:
-logits max-abs-diff 3.1e-5 on CUDA, where the composed attention gives 3.4e-5.
+**v0.2.0** shipped 2026-10-03. *The backward in one kernel, still deterministic*: each key block
+computes dK, dV and a dQ partial in one pass, the dQ partials added in key-block order.
 
 ---
 
-## Next: v0.3.0 — a faster forward
+## Next: candidates (not yet chosen)
 
-Plan, predictions and results as they come: [`docs/roadmap-v0.3.0.md`](docs/roadmap-v0.3.0.md).
-
-**Why.** The forward is the one place this crate is behind: ×1.5 SDPA's time on the 5060 Ti,
-×1.09 on the 5090. It also runs more often than it looks. In the canvas trainer it runs about
-three times per layer and step — the carry's no-grad pass, the training pass, the validation
-share — measured as ~18 forward calls per step at batch 64 (nsys, 2026-10-02), against 6
-backward calls. And evaluation, which decodes for 101 rounds per problem, is forward only.
-
-**What it could buy (estimates, not measurements).** At SDPA's forward speed, 18 calls × 0.47 ms
-≈ **−8.5 ms per training step** at batch 64 on the 5060 Ti (~7 % of a ~122 ms step), but only
-≈ −0.3 ms on the 5090 at the same shape, where training is rented. The larger payoff may be the
-local evaluations, run on the 5060 Ti: a registered readout of one run took ~25 min of that
-card on 2026-10-03. How much of it is attention is not known yet; step 0 measures it.
-
-**Step 0 — measure first.** One nsys capture of a 200-problem canvas evaluation on the RTX 5060
-Ti (fused-attention build, the forward kernel's share of GPU time), with `--force-overwrite=true`
-and the binary's first run discarded. If attention is a small share of evaluation, v0.3.0 is
-worth its training gain on mid-range cards only, and its priority is decided on that.
-
-**Read first (C++ before code).**
-- PyTorch v2.10's memory-efficient forward (`kernel_forward.h`, `mem_eff_attention`): its
-  tiling, warps per block and blocks per SM for fp32, head_dim 64.
-- cuBLAS's fp32 SIMT kernels: the 8×8-per-thread register tile.
-- FlashAttention-2's `flash_fwd_kernel.h` (vendored in candle-flash-attn) for the online-softmax
-  bookkeeping it already follows.
-
-**The levers, as measured.** Today's forward block holds Q, K, V and P tiles of 64 rows × 68
-floats in **69,632 bytes of dynamic shared memory**, which fits **one block per SM** on the 5060
-Ti; 8 warps; each thread a 4×4 register tile. SDPA runs 4 warps × 3 blocks per SM, with larger
-per-thread tiles, and it runs its matmuls on tensor cores as 3xTF32 where this crate uses plain
-FFMA; which of the two differences dominates is not measured yet, and the first profile of the
-forward should say. Candidates: smaller tiles, or K/V tiles shared across query rows, to fit 2–3
-blocks per SM; an 8×8 (or 4×8) per-thread tile; fewer warps per block. Each is a change to
-`TWIN`-annotated constants on both sides (`src/cuda.rs`, `kernels/fused_attn.cu`).
-
-**Bars that must hold.**
-- **Determinism:** `tests/parity.rs::cuda_backward_is_deterministic` passes, and
-  `bench/compare.py`'s bitwise rerun check (outputs and gradients) still reads `True`; no atomics
-  in any reduction (`CONVENTIONS.md` § *DETERMINISM Annotation*).
-- **Accuracy:** against fp64, no worse than v0.2's table, on both cards.
-- **Parity:** CUDA vs the CPU reference within the measured band (`cuda_matches_cpu`).
-- **Downstream:** candle-mi's `othello-fused` oracle still passes.
-
-**Done when** the forward matches SDPA's at the canvas shape on both cards, measured with
-`bench/compare.py` (alternated rounds, same session, report committed under `bench/results/`),
-the trainer A/B is re-run on a rented 5090, and the release goes through the `CLAUDE.md`
-checklist, rehearsal included.
-
----
+- **Larger tiles at 8 warps per SM.** Both kernels now wait mostly on shared-memory loads; the
+  128-thread remedy was measured slower (devlog FA11: fewer warps cost more than the loads saved).
+  The remaining route keeps 256 threads with larger tiles, which needs swizzled, unpadded shared
+  memory to fit 99 KB per block (FA10).
+- **The L2 question, settled.** FA13 found the 5090's smaller no-grad forward gain follows L2
+  capacity; a profiler-free test (flush L2 between calls) would confirm it.
+- **The training step's other costs.** The canvas step gains +1.8 % for −13 % on the attention
+  call: the step is partly host-bound — candle and candle-mi territory, not this crate's.
 
 ## Later (speculative)
 

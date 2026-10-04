@@ -16,8 +16,9 @@
 //!
 //! On CUDA: a FlashAttention-2-style forward (online softmax, the `[seq, seq]` scores never
 //! written) and a deterministic backward in two kernels: `D = rowsum(dO ∘ O)`, then one pass per
-//! key block that adds the dQ partials in key-block order. On CPU: the composed reference, so every
-//! test runs anywhere. It works against STOCK candle: the PTX is loaded into candle's own context
+//! key block that adds the dQ partials in key-block order. Both kernels copy their next tiles with
+//! asynchronous loads (`cp.async`, compute capability 8.0+) while the current tile computes. On
+//! CPU: the composed reference, so every test runs anywhere. It works against STOCK candle: the PTX is loaded into candle's own context
 //! and launched on candle's own stream.
 //!
 //! # Example
@@ -55,11 +56,13 @@
 //! The op therefore keeps the per-row log-sum-exp `L` (`[b, h, s]`, 1/64 of `O`) in a field, and
 //! its output is `O` alone. (kaio-candle, the prior art, instead re-runs the forward in `bwd`.)
 //!
-//! # Limits (v0.2)
+//! # Limits (v0.3)
 //!
 //! f32 only; on CUDA `head_dim` must be 64 (the CPU path takes any). No dropout, no additive
 //! mask beyond `causal`. The backward's dQ turn counters use `ld.acquire` / `st.release` at GPU
-//! scope, so the CUDA path needs compute capability 7.0 (Volta) or newer.
+//! scope, so the CUDA path needs compute capability 7.0 (Volta) or newer; below 8.0 the kernels
+//! use ordinary loads instead of `cp.async`. CUDA 13 toolkits no longer compile for Volta: build
+//! with CUDA 12 there.
 
 #![deny(warnings)]
 // The MSRV lint guard: `deny(warnings)` implies `deny(unknown_lints)`, and the MSRV toolchain's

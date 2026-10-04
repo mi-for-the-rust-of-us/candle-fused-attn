@@ -187,6 +187,9 @@ Three rules make its numbers mean something: alternate the candidates in rounds 
 discard the first run of a freshly built binary (the driver compiles its kernels then); and compare
 with PyTorch only on the same machine, in the same session.
 
+`bench/box.sh <label>` runs the whole measurement of one card — 0.2.0 against your checkout, bit
+for bit and in time, and against PyTorch — as the README's numbers were measured.
+
 ## 7. When not to use it
 
 - `head_dim` other than 64, or dtypes other than f32, on CUDA.

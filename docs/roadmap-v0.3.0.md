@@ -39,4 +39,6 @@ its status; every measurement — registered before it runs, then its result —
 | 2 | L1 for the backward | [FA9](devlog.md#fa9--lever-l1-for-the-backward-q-do-l-and-d-of-the-next-query-tile-loaded-during-this-one) | done — backward −14.3 %, bitwise identical |
 | 2 | L2 design | [FA10](devlog.md#fa10--design-l2-fewer-shared-loads-per-ffma) | done — fragment double-buffering rejected (nvcc already pipelines) |
 | 2 | L2, forward: 128 threads, 8 × 4 | [FA11](devlog.md#fa11--l2-forward-128-threads-8--4-outputs-per-thread) | **rejected** — +15.5 % (fewer warps cost more than the loads saved) |
-| 3 | rented RTX 5090 + RTX 4090, release | — | — |
+| 3 | three cards (local 5060 Ti; rented 4090 and 5090), training step | [FA12](devlog.md#fa12--v030-on-three-cards-rtx-5060-ti-rtx-4090-rtx-5090) | done — bitwise identical on all; faster than SDPA (kernel time) on all |
+| 3 | the 5090's no-grad forward and L2 | [FA13](devlog.md#fa13--does-l2-residency-explain-the-5090s-smaller-no-grad-forward-gain) | done — the gap follows L2 capacity |
+| 3 | release 0.3.0 | — | in progress |

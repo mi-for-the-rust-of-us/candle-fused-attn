@@ -41,53 +41,52 @@ forward and backward, single-head).
 
 ## What it does
 
-- **CUDA**: the FlashAttention-2 algorithm (online softmax; the `[seq, seq]` scores are never
-  written; only O and the row log-sum-exp are saved) in plain fp32 FFMA, register micro-tiled.
-- **A deterministic backward in one pass**: each key block computes dK, dV and a dQ partial,
-  computing S and dP once per tile. The key blocks add their dQ partials **in key-block order**,
-  under a turn counter per query tile (acquire/release at GPU scope, the ordered semaphore of
-  CUTLASS's serial split-K). Reruns are bit-identical. PyTorch's fp32 backward adds the same
-  partials under a spin lock in arrival order.
-- **No copies in, none out**: q, k, v are read through their strides (the head split of a fused
-  qkv projection is free; a layout the kernels cannot read in place is copied first), and O is
-  written in the merge-heads layout.
-- **No glue on the qkv path**: no head split or merge, and none of the zero-padded per-view
-  gradients candle's `narrow` backward would build and sum. At the shape below, forward + backward
-  costs 4.97 ms of kernel time on the RTX 5060 Ti, against 11.99 ms for the same attention through
-  `fused_attention` on three `narrow` views of the projection (5090: 0.885 against 1.540 ms; the
-  `candle_fused` rows of the reports below).
-- **No re-run of the forward in `bwd`**: candle hands `bwd` the op instance that ran the forward,
-  so the op keeps the row log-sum-exp in a field.
+- **CUDA**: the FlashAttention-2 algorithm in plain fp32 FFMA — an online softmax, the `[seq, seq]`
+  scores never written, only O and the row log-sum-exp saved.
+- **Loads overlap the math**: both kernels copy their next tiles with asynchronous loads
+  (`cp.async`, compute capability 8.0+) while the current tile computes.
+- **A deterministic backward in one pass**: each key block computes dK, dV and a dQ partial, and
+  the key blocks add their dQ partials **in key-block order** (a turn counter per query tile).
+  Reruns are bit-identical; PyTorch's fp32 backward adds the same partials in arrival order.
+- **No copies, no glue on the qkv path**: q, k, v are read through their strides, O is written in
+  the merge-heads layout, and the backward writes one gradient shaped like the projection. On an
+  RTX 5060 Ti that path costs 3.98 ms per forward + backward, against 11.25 ms for the same
+  attention on three `narrow` views of the projection (RTX 5090: 0.89 against 2.13 ms).
+- **No re-run of the forward in `bwd`**: the op keeps the row log-sum-exp from its forward.
 - **CPU**: the composed reference, so the gradient tests run anywhere.
 
 ## Measured
 
 Kernel time per call, in **milliseconds**, at the canvas trainer's shape (b 64 · h 6 · s 240 ·
-d 64, non-causal); lower is better, **bold** = fastest. PyTorch SDPA is its fp32
+d 64, non-causal), 2026-10-04; lower is better, **bold** = fastest. PyTorch SDPA is its fp32
 `scaled_dot_product_attention` (memory-efficient backend, 3xTF32 on tensor cores), measured in the
-same session. The full history, with every report: [RESULTS.md](RESULTS.md).
+same session. Every number and its report: [RESULTS.md](RESULTS.md).
 
-| ![RTX 5060 Ti](https://img.shields.io/badge/RTX_5060_Ti-76B900?logo=nvidia&logoColor=white) 2026-10-04 | forward | forward + backward |
+| ![RTX 5060 Ti](https://img.shields.io/badge/RTX_5060_Ti-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
 |---|--:|--:|
-| **candle-fused-attn** 0.3.0-dev | **0.859** | **4.518** |
-| PyTorch SDPA | 0.964 | 5.021 |
+| **candle-fused-attn** 0.3.0 | **0.895** | **3.982** |
+| PyTorch SDPA | 0.978 | 4.963 |
 
-| ![RTX 5090](https://img.shields.io/badge/RTX_5090-76B900?logo=nvidia&logoColor=white) 2026-10-03 | forward | forward + backward |
+| ![RTX 4090](https://img.shields.io/badge/RTX_4090-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
 |---|--:|--:|
-| **candle-fused-attn** 0.2 | 0.226 | **0.885** |
-| PyTorch SDPA | **0.207** | 1.022 |
+| **candle-fused-attn** 0.3.0 | **0.254** | **1.200** |
+| PyTorch SDPA | 0.334 | 1.559 |
+
+| ![RTX 5090](https://img.shields.io/badge/RTX_5090-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
+|---|--:|--:|
+| **candle-fused-attn** 0.3.0 | **0.192** | **0.891** |
+| PyTorch SDPA | 0.243 | 1.104 |
 
 **Accuracy** against fp64 (normwise relative error, dQ): candle-fused-attn 4.0e-7, SDPA 8.0e-7 —
-plain fp32 FMAs keep half SDPA's error. 0.3.0's outputs are bit-identical to 0.2.0's, and every
-rerun is bit-identical.
+plain fp32 FMAs keep half SDPA's error.
 
-**How it got fast** (the reasoning, every prediction and every rejected idea:
-[`docs/devlog.md`](docs/devlog.md)): the forward and the backward copy their next tiles with
-asynchronous loads while the current tile computes, so the GPU never waits on memory between
-tiles (forward −42.6 %, backward −14.3 % on the RTX 5060 Ti, outputs unchanged bit for bit).
+**0.2.0 → 0.3.0**, alternated in one session, outputs bit-identical: forward kernel −37 to −44 %
+inside training calls (−20 to −40 % in no-grad calls), backward −9 to −16 %, an attention
+training call −13 to −16 %, on the three cards. How, with
+every prediction and every rejected idea: [`docs/devlog.md`](docs/devlog.md).
 
-**In a training step**, against its PyTorch reference: from 5.1× slower (2026-07-29) to 0.93×
-— faster — on an RTX 5090 (2026-10-03), before this release's gains.
+**In a training step** (a 6-layer masked-diffusion model through candle-mi) against its PyTorch
+reference: 5.1× slower on 2026-07-29, **0.90×** on an RTX 5090 with this release.
 
 ## Tutorial
 
@@ -99,8 +98,9 @@ use it. Its code is [`examples/tutorial.rs`](examples/tutorial.rs), which CI run
 
 - fp32 only. On CUDA, `head_dim` must be 64 (the CPU path takes any).
 - No dropout, and no additive mask beyond `causal`.
-- The CUDA path needs compute capability **7.0 (Volta) or newer**. Tested on sm_120: RTX 5060 Ti
-  and RTX 5090.
+- The CUDA path needs compute capability **7.0 (Volta) or newer**; below 8.0 it uses ordinary
+  loads instead of `cp.async`. CUDA 13 toolkits no longer compile for Volta: on a V100, build
+  with CUDA 12. Tested on an RTX 5060 Ti, an RTX 4090 and an RTX 5090.
 
 ## Building and testing
 
@@ -108,6 +108,7 @@ use it. Its code is [`examples/tutorial.rs`](examples/tutorial.rs), which CI run
 cargo test                     # the CPU path: no GPU, no CUDA toolkit
 cargo test --features cuda     # the kernels: CUDA vs CPU within the measured band, bitwise reruns
 bash scripts/ci-local.sh       # before pushing: CI + the release's checks (--no-cuda: no GPU)
+bash bench/box.sh <label>      # one card's measurement: 0.2.0 vs this checkout, and PyTorch
 ```
 
 The `cuda` feature compiles the kernels with `nvcc` at build time (the CUDA toolkit must be
@@ -128,7 +129,7 @@ python bench/compare.py run    # vs PyTorch: speed AND accuracy (torch, safetens
   attention-internal hook is requested at that layer, and keeps the composed attention otherwise.
 - askesis (research, not public) — the masked-diffusion planner these kernels were written for.
   Its trainer, through candle-mi, is the training step measured above
-  ([report](bench/results/2026-10-03-rtx5090-trainer-ab.md)).
+  ([report](bench/results/2026-10-04-rtx5090-trainer-ab-v0.2.0-vs-v0.3.md)).
 
 ## License
 
