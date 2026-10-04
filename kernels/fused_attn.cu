@@ -82,10 +82,12 @@ __device__ __forceinline__ float dot4(float4 a, float4 b, float acc) {
 }
 
 // `rows` rows of a strided [seq, HD] slice from `row0` into a [rows][LD] tile, float4 at a time
-// (the launcher guarantees 16-byte alignment of every row); rows past `seq` are zero.
+// (the launcher guarantees 16-byte alignment of every row); rows past `seq` are zero. `NTH` is the
+// block's thread count (the forward runs 128, the backward NT).
+template <int NTH = NT>
 __device__ __forceinline__ void load_tile4(float* dst, const float* __restrict__ src,
                                            int64_t s_stride, int row0, int rows, int seq) {
-  for (int idx = threadIdx.x; idx < rows * (HD / 4); idx += NT) {
+  for (int idx = threadIdx.x; idx < rows * (HD / 4); idx += NTH) {
     const int r = idx / (HD / 4), c4 = idx % (HD / 4);
     const int row = row0 + r;
     const float4 val = row < seq ? ld4(src + (int64_t)row * s_stride + 4 * c4)
@@ -105,10 +107,11 @@ __device__ __forceinline__ void load_tile4(float* dst, const float* __restrict__
 // test it.
 // REFERENCE: kernel_traits.h (FlashAttention-2, as vendored in candle-flash-attn) --
 // SM80_CP_ASYNC_CACHEGLOBAL<uint128_t> copies when __CUDA_ARCH__ >= 800, ordinary ones below.
+template <int NTH = NT>
 __device__ __forceinline__ void load_tile_async(float* dst, const float* __restrict__ src,
                                                 int64_t s_stride, int row0, int rows, int seq) {
 #if __CUDA_ARCH__ >= 800 && !defined(FATTN_SYNC_LOADS)
-  for (int idx = threadIdx.x; idx < rows * (HD / 4); idx += NT) {
+  for (int idx = threadIdx.x; idx < rows * (HD / 4); idx += NTH) {
     const int r = idx / (HD / 4), c4 = idx % (HD / 4);
     const int row = row0 + r;
     const float* g = src + (int64_t)(row < seq ? row : row0) * s_stride + 4 * c4;
@@ -118,7 +121,7 @@ __device__ __forceinline__ void load_tile_async(float* dst, const float* __restr
                  : "memory");
   }
 #else
-  load_tile4(dst, src, s_stride, row0, rows, seq);
+  load_tile4<NTH>(dst, src, s_stride, row0, rows, seq);
 #endif
 }
 
@@ -390,11 +393,15 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
 
 // ------------------------------------------------------------------------------------------------
 // Forward. grid (ceil(S / 64), H, B). A block owns 64 queries and walks key tiles of 64.
+//   FW_NT = 128 threads (devlog FA11: 8 x 4 outputs per thread, 25 % fewer shared loads than
+//   v0.2's 256 threads with 4 x 4, at 4 warps per SM instead of 8).
 //   phase 1: S for [64 queries x 64 keys]; thread (ty = tid / 16, tx = tid % 16) owns query rows
-//            4ty .. +4 and keys tx + 16 jj; the online-softmax state (m, l) of its 4 rows is
+//            8ty .. +8 and keys tx + 16 jj; the online-softmax state (m, l) of its 8 rows is
 //            reduced over the 16 lanes sharing ty; P goes to shared memory.
-//   phase 2: the SAME thread owns rows 4ty .. +4 and dims 4tx .. +4 of the O accumulator, so the
+//   phase 2: the SAME thread owns rows 8ty .. +8 and dims 4tx .. +4 of the O accumulator, so the
 //            rescale by exp(m_old - m_new) and the final 1/l never cross threads.
+//   Every output's sum keeps v0.2's order (over the head dimension, over keys): only the thread
+//   computing it changed, so the outputs are bit-identical to v0.2's.
 // Out: o [b, s, h, d] (the merge-heads layout) and lse [b, h, s], the backward's saved state.
 // Loads overlap the math (devlog FA7): V(n) travels while phase 1 computes S from K(n), and
 // K(n + 1) travels while phase 2 consumes V(n); one K and one V buffer suffice, because each is
@@ -408,6 +415,8 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
 // ------------------------------------------------------------------------------------------------
 #define FW_QRYS 64  // TWIN: src/cuda.rs:FWD_QUERIES
 #define FW_KEYS 64  // TWIN: src/cuda.rs:FWD_KEYS
+#define FW_NT 128   // threads per forward block; TWIN: src/cuda.rs:FWD_THREADS
+#define FW_RPT (FW_QRYS * 16 / FW_NT)  // query rows per thread: 8 (16 lanes share a row group)
 
 // DETERMINISM (row_max16, row_sum16): the xor butterfly 1, 2, 4, 8 over the 16 lanes of a row;
 // the max is order-free and the sum's order is fixed.
@@ -426,7 +435,7 @@ __device__ __forceinline__ float row_sum16(float x) {
   return x + __shfl_xor_sync(0xffffffffu, x, 8);
 }
 
-extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
+extern "C" __global__ void __launch_bounds__(FW_NT) fattn_fwd_f32_d64(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     float* __restrict__ o, float* __restrict__ lse,
     int B, int H, int S, float scale, int causal,
@@ -441,7 +450,7 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
 
   const int b = blockIdx.z, h = blockIdx.y, q0 = blockIdx.x * FW_QRYS;
   const int tid = threadIdx.x, ty = tid / 16, tx = tid % 16;
-  const int r0 = 4 * ty, d0 = 4 * tx;
+  const int r0 = FW_RPT * ty, d0 = 4 * tx;
   const float* kp = k + b * k_sb + h * k_sh;
   const float* vp = v + b * v_sb + h * v_sh;
 
@@ -449,13 +458,13 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
   const int k_end = causal ? min(S, q0 + FW_QRYS) : S;
 
   // Prologue: Q and the first key tile, one group of copies.
-  load_tile_async(Qs, q + b * q_sb + h * q_sh, q_ss, q0, FW_QRYS, S);
-  load_tile_async(Ks, kp, k_ss, 0, FW_KEYS, S);
+  load_tile_async<FW_NT>(Qs, q + b * q_sb + h * q_sh, q_ss, q0, FW_QRYS, S);
+  load_tile_async<FW_NT>(Ks, kp, k_ss, 0, FW_KEYS, S);
   cp_async_commit();
 
-  float m[4], l[4], acc[4][4];
+  float m[FW_RPT], l[FW_RPT], acc[FW_RPT][4];
 #pragma unroll
-  for (int r = 0; r < 4; ++r) {
+  for (int r = 0; r < FW_RPT; ++r) {
     m[r] = -INFINITY;
     l[r] = 0.0f;
 #pragma unroll
@@ -467,29 +476,29 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
     // the previous tile's Vs and Ps (its phase 2): V(k0) may now overwrite Vs.
     cp_async_wait_all();
     __syncthreads();
-    load_tile_async(Vs, vp, v_ss, k0, FW_KEYS, S);  // travels during phase 1
+    load_tile_async<FW_NT>(Vs, vp, v_ss, k0, FW_KEYS, S);  // travels during phase 1
     cp_async_commit();
 
-    float s[4][4];
+    float s[FW_RPT][4];
 #pragma unroll
-    for (int r = 0; r < 4; ++r)
+    for (int r = 0; r < FW_RPT; ++r)
 #pragma unroll
       for (int jj = 0; jj < 4; ++jj) s[r][jj] = 0.0f;
 #pragma unroll 4
     for (int c = 0; c < HD; c += 4) {
-      float4 qv[4];
+      float4 qv[FW_RPT];
 #pragma unroll
-      for (int r = 0; r < 4; ++r) qv[r] = ld4(Qs + (r0 + r) * LD + c);
+      for (int r = 0; r < FW_RPT; ++r) qv[r] = ld4(Qs + (r0 + r) * LD + c);
 #pragma unroll
       for (int jj = 0; jj < 4; ++jj) {
         const float4 kv = ld4(Ks + (tx + 16 * jj) * LD + c);
 #pragma unroll
-        for (int r = 0; r < 4; ++r) s[r][jj] = dot4(qv[r], kv, s[r][jj]);
+        for (int r = 0; r < FW_RPT; ++r) s[r][jj] = dot4(qv[r], kv, s[r][jj]);
       }
     }
 
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
+    for (int r = 0; r < FW_RPT; ++r) {
       const int i = q0 + r0 + r;
       float tmax = -INFINITY;
 #pragma unroll
@@ -520,20 +529,20 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
     cp_async_wait_all();
     __syncthreads();
     if (k0 + FW_KEYS < k_end) {
-      load_tile_async(Ks, kp, k_ss, k0 + FW_KEYS, FW_KEYS, S);  // travels during phase 2
+      load_tile_async<FW_NT>(Ks, kp, k_ss, k0 + FW_KEYS, FW_KEYS, S);  // travels during phase 2
       cp_async_commit();
     }
 
     // O[i] += sum_j P[i][j] V[j], four keys at a time
 #pragma unroll 2
     for (int j = 0; j < FW_KEYS; j += 4) {
-      float4 pv[4], vv[4];
+      float4 pv[FW_RPT], vv[4];
 #pragma unroll
-      for (int r = 0; r < 4; ++r) pv[r] = ld4(Ps + (r0 + r) * LD + j);
+      for (int r = 0; r < FW_RPT; ++r) pv[r] = ld4(Ps + (r0 + r) * LD + j);
 #pragma unroll
       for (int t = 0; t < 4; ++t) vv[t] = ld4(Vs + (j + t) * LD + d0);
 #pragma unroll
-      for (int r = 0; r < 4; ++r) {
+      for (int r = 0; r < FW_RPT; ++r) {
         const float pr[4] = {pv[r].x, pv[r].y, pv[r].z, pv[r].w};
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
@@ -547,7 +556,7 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
   }
 
 #pragma unroll
-  for (int r = 0; r < 4; ++r) {
+  for (int r = 0; r < FW_RPT; ++r) {
     const int i = q0 + r0 + r;
     if (i >= S) continue;
     const float inv = 1.0f / l[r];
