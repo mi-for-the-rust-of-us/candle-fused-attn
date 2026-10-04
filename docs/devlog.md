@@ -23,6 +23,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA10](#fa10--design-l2-fewer-shared-loads-per-ffma) | 2026-10-04 | how to cut shared loads per FFMA on a 100 KB/SM card? | design; explicit fragment double-buffering **rejected** before building |
 | [FA11](#fa11--l2-forward-128-threads-8--4-outputs-per-thread) | 2026-10-04 | half the warps, twice the work per thread: faster or slower? | **slower** (+15.5 %): P1–P3 met, P4 missed — **rejected, reverted** |
 | [FA12](#fa12--v030-on-three-cards-rtx-5060-ti-rtx-4090-rtx-5090) | 2026-10-04 | does v0.3.0 hold on other cards, and in the whole training step? | P1, P3, P4 **met**; P2 half (5090 no-grad −19.7 %); P5 **missed** low (+1.8 % step) — release |
+| [FA13](#fa13--does-l2-residency-explain-the-5090s-smaller-no-grad-forward-gain) | 2026-10-04 | is the 5090's smaller no-grad forward gain L2 residency? | registered |
 
 ---
 
@@ -682,3 +683,33 @@ assumed, and the step already waits partly on the host (rentals.md, 2026-10-03).
 candle's glue around the op (separate small kernels and their launches) outweighs the kernels in
 wall time. **Decision (the registered rule): no card failed P1 — release 0.3.0 with every card's
 numbers.**
+
+---
+
+## FA13 — does L2 residency explain the 5090's smaller no-grad forward gain?
+
+*Registered 2026-10-04, before the run (FA12's open question; the rented box blocked the counters).*
+
+**Hypothesis.** In back-to-back no-grad forward calls, the 70.8 MB `qkv` of the canvas shape stays
+resident in the RTX 5090's L2 (~96 MB), so v0.2's exposed loads hit L2 and v0.3's asynchronous
+loads have less latency to hide; inside training calls, the backward's traffic evicts it. The
+RTX 5060 Ti's L2 is 32 MB: the same mechanism should appear at **batch 16** (`qkv` 17.7 MB, fits)
+and not at batch 64 (70.8 MB, does not — the control).
+
+**Protocol (local RTX 5060 Ti).** Seeded inputs at b 16 and b 64 (h 6, s 240). (a) Nsight Compute
+on v0.2's forward (`target/v02/compare.exe`, `compare` example's `nsys` mode), one launch after 10
+warm-up calls, in the `fwd` phase (preceded by forwards on the same `qkv`) and in the `train` phase
+(preceded by a backward), with `--cache-control none --replay-mode application` so that each pass
+sees the real cache state: L2 hit rate (`lts__t_sector_hit_rate.pct`), DRAM bytes read, the
+long-scoreboard stall. (b) `bench/ab.py` v0.2 against v0.3 (FA9's kernels) at b 16.
+
+**Predictions.**
+- **P1 (b 16):** v0.2's forward has an L2 hit rate at least 20 points higher, and reads at most
+  half the DRAM bytes, in the `fwd` phase than in the `train` phase.
+- **P2 (b 64, control):** the two phases' hit rates are within 10 points.
+- **P3 (b 16):** v0.3's forward gain over v0.2 is at least 10 points smaller in no-grad calls than
+  inside training calls (at b 64 the gap was 3.6 points: −40.0 % against −43.6 %).
+
+**Reading (fixed now).** P1 and P2 together support the hypothesis; with P3 the 5090's smaller
+no-grad gain is explained by the card's cache, not by a defect of v0.3. P1 failing refutes it, and
+the 5090's number stays unexplained.
