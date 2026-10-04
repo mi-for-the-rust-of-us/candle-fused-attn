@@ -126,3 +126,17 @@ the estimate assumed ~15 TFLOPS of sgemm where the card delivered less. The atte
 
 **Observed, not registered.** The evaluation is GPU-bound (the wall gain, 1.63 s, equals the
 kernel gain, 1.61 s), and its largest consumer is the linear layers' sgemm — outside this crate.
+
+### 0c — the profiler is ready (2026-10-04)
+
+Nsight Compute **2026.3.1** (winget `Nvidia.Nsight.Compute`; it replaced 2024.3, which listed no
+Blackwell chip) lists `gb206` (RTX 5060 Ti) and `gb202` (RTX 5090). GPU performance counters
+opened to all users in the NVIDIA Control Panel (Éric). Smoke test: one launch of
+`fattn_fwd_f32_d64` at a deliberately tiny shape (b 4: 96 blocks on 36 SMs), `--section
+SpeedOfLight`, 9 replay passes, ~3 s — it profiles; its numbers are not a measurement.
+
+**Rule for the phases ahead:** Nsight Compute replays each kernel and locks the clocks (its default
+`--clock-control base`), so its durations are not comparable with nsys or `compare.py`. It answers
+*why* (achieved occupancy, warp stall reasons, shared-memory traffic, instruction mix); `compare.py`
+answers *how fast*. Every profile is taken at the canvas shape (b 64 · h 6 · s 240 · d 64) unless
+an entry says otherwise, and is registered before it runs, like any other measurement.
