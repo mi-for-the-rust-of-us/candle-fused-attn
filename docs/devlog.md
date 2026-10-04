@@ -18,7 +18,8 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA5](#fa5--the-first-profile-both-forward-kernels-at-the-canvas-shape) | 2026-10-04 | why is our forward slower? | P1, P4, P5 **met**; P2 **missed** (SDPA has OUR occupancy); P3 **half missed** (top stall: global loads) |
 | [FA6](#fa6--design-the-forwards-levers-ranked-with-predicted-gains) | 2026-10-04 | which levers, in which order? | design |
 | [FA7](#fa7--lever-l1-asynchronous-kv-loads-overlapped-with-the-math) | 2026-10-04 | does overlapping the K/V loads with the math close the gap? | P1, P3, P5 **met**; P2 **missed high** (−42.6 %); P4 half missed (114 registers) — **kept** |
-| [FA8](#fa8--the-backward-kernel-profiled-before-any-change) | 2026-10-04 | where does the backward kernel's time go? | registered |
+| [FA8](#fa8--the-backward-kernel-profiled-before-any-change) | 2026-10-04 | where does the backward kernel's time go? | P1, P2, P4, P5 **met**; P3 **missed** narrowly (barrier 4th) |
+| [FA9](#fa9--lever-l1-for-the-backward-q-do-l-and-d-of-the-next-query-tile-loaded-during-this-one) | 2026-10-04 | does prefetching the next query tile speed the backward? | registered |
 
 ---
 
@@ -409,3 +410,62 @@ passed the turn; the block waits at a barrier).
 - Barrier the top stall → the dQ turn order is the bottleneck; that lever (how blocks hand over
   dQ) is designed first.
 - Neither → read the profile before anything is registered.
+
+### FA8 — RESULT (2026-10-04, ~09:35): long scoreboard on top, but shared memory nearly level
+
+Profiles: `profiles/2026-10-04-rtx5060ti-bwd-{candle-fused-attn-v0.2,sdpa-mem-eff}.ncu-repz`.
+Convention: "selected" (the cycle a warp issues) is not counted as a stall.
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1: occupancy | 8 warps per SM; 14–16.7 % achieved | 69,632 B, 1 block; **16.65 %** | met |
+| P2: long scoreboard in the top two, ≥ 1.0 | | **1.16, first**; short scoreboard 1.11, second | met |
+| P3: barrier in the top three, ≥ 0.5 | | 0.66, **fourth** (MIO throttle 0.68 third) | **missed** (narrowly) |
+| P4: compute throughput ≤ 40 % | | 34.9 % | met |
+| P5: SDPA on the tensor pipe, ours not | | SDPA 48.3 G TF32 operations, tensor pipe 30.6 %; ours 0 | met |
+
+| | ours `fattn_bwd_f32_d64` | SDPA `fmha_cutlassB_f32_aligned_64x64_k64_sm80` |
+|---|--:|--:|
+| threads; registers; shared memory per block | 256; 128; 69,632 B | 128; 232; 53,504 B |
+| warps per SM (theoretical / achieved) | 8 / 7.99 | **4** / 4.0 |
+| duration under ncu (clocks locked) | **2.89 ms** | 3.33 ms |
+| compute throughput; issue slots busy | 34.9 %; 33.0 % | 61.8 %; 15.4 % |
+| instructions (warp level); shared loads | 357.6 M; **40.9 M** | 192.2 M; 10.7 M |
+| top stalls | long sb 1.16, short sb 1.11, MIO throttle 0.68, barrier 0.66 | math pipe throttle 1.98, wait 1.65, long sb 0.77 |
+
+**Reading.** Our backward is already faster than SDPA's, which runs only 4 warps per SM here.
+Its stalls are more balanced than v0.2's forward was: global-load latency is ~19 % of the cycles
+between issues (forward: ~35 %), and shared memory is close behind — 3.8× SDPA's shared loads,
+and a filling MIO queue. **Decision (the registered rule):** long scoreboard is the top stall, so
+FA7's lever comes next for the backward (FA9), with a smaller expected gain; fewer shared loads
+per FFMA (L2) matters for the backward as much as for the forward.
+
+---
+
+## FA9 — lever L1 for the backward: Q, dO, L and D of the next query tile loaded during this one
+
+*Registered 2026-10-04, before any code.*
+
+**Change.** In `fattn_bwd_f32_d64`, the per-query-tile loads (`load_tile4` of Q and dO, lines
+217–218 at `26eb8bb`, and the per-row reads of L and D in phase 1) become `cp.async` copies of
+the NEXT query tile, issued at the start of the current one into a second Q / dO buffer (double
+buffering: the current tile's Q and dO are read until the end of phase 2, so a single buffer
+could only overlap phase 3). L and D of the tile go to shared memory with them. Shared memory
+grows by 2 × 32 × 68 floats + 2 × 2 × 32 floats = 17,920 B, to 87,552 B: still one block per SM
+(100 KB). The arithmetic and the dQ turn order are unchanged. Below compute capability 8.0 (and
+under `-DFATTN_SYNC_LOADS`), the same double-buffered schedule with ordinary loads.
+`REFERENCE`: FlashAttention-2's backward (`flash_bwd_kernel.h`, its `Double_buffer` option).
+
+**Predictions.**
+- **P1 (gate):** dQ, dK, dV (and O) bitwise identical to `26eb8bb`'s on the 6 shapes of
+  `bench/bitwise.py`, native and forced-fallback builds.
+- **P2:** backward kernel time **−8 to −18 %** in an alternated A/B against `26eb8bb`
+  (`bench/ab.py`, `train` phase), the forward unchanged within ±2 %.
+- **P3:** long scoreboard from 1.16 to **≤ 0.5**; the top stall becomes short scoreboard or MIO
+  throttle.
+- **P4:** shared memory 87,552 B; registers ≤ 168 (at 256 threads, the most that still fits one
+  block); occupancy unchanged.
+
+**Decision rule (fixed now).** P1 is a gate. Keep at ≥ 5 % on the backward kernel; below 3 %,
+revert with a `MEASURED-REVERT` note. Then L2 (register tiles), designed for both kernels at once,
+since both are now limited by shared-memory traffic.
