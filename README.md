@@ -25,8 +25,9 @@ let o = candle_fused_attn::fused_attention(&q, &k, &v, 1.0 / 8.0, false)?;
 
 **Why.** candle has no fused attention that can *train*, and none in fp32 on CUDA:
 `candle-flash-attn` is f16/bf16 and forward-only. Training in fp32 is the point for work where
-the numbers must be reproducible and comparable across runs. Prior art: kaio-candle 0.2.0 (fp32
-forward and backward, single-head).
+the numbers must be reproducible and comparable across runs. Prior art:
+[kaio-candle](https://github.com/dmriding/kaio/tree/main/kaio-candle) 0.2.0 (fp32 forward and
+backward, single-head).
 
 ## Table of Contents
 
