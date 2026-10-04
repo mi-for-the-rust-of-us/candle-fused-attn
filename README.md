@@ -62,47 +62,32 @@ forward and backward, single-head).
 
 ## Measured
 
-v0.2, at b 64 · h 6 · s 240 · d 64, non-causal, with `bench/compare.py`: one unit for every
-candidate (fused qkv projection → merged output), shared seeded inputs, kernel time per call by
-nsys. *Forward* is a no-grad call; *forward + backward* is a training call (backward via
-`sum(o ∘ dout)`), net of that loss head. Reports, committed:
-[RTX 5090](bench/results/2026-10-03-rtx5090-compare.md) (torch 2.14),
-[RTX 5060 Ti](bench/results/2026-10-03-rtx5060ti-compare.md) (torch 2.10), both 2026-10-03.
+Kernel time per call, in **milliseconds**, at the canvas trainer's shape (b 64 · h 6 · s 240 ·
+d 64, non-causal); lower is better, **bold** = fastest. PyTorch SDPA is its fp32
+`scaled_dot_product_attention` (memory-efficient backend, 3xTF32 on tensor cores), measured in the
+same session. The full history, with every report: [RESULTS.md](RESULTS.md).
 
-Kernel time per call, in **milliseconds**; lower is better, **bold** = fastest.
-
-| ![RTX 5090](https://img.shields.io/badge/RTX_5090-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
+| ![RTX 5060 Ti](https://img.shields.io/badge/RTX_5060_Ti-76B900?logo=nvidia&logoColor=white) 2026-10-04 | forward | forward + backward |
 |---|--:|--:|
-| **candle-fused-attn** | 0.226 | **0.885** |
-| PyTorch SDPA (memory-efficient, CUTLASS) | **0.207** | 1.022 |
-| PyTorch, composed (matmul, softmax, matmul) | 0.443 | 1.310 |
+| **candle-fused-attn** 0.3.0-dev | **0.859** | **4.518** |
+| PyTorch SDPA | 0.964 | 5.021 |
 
-| ![RTX 5060 Ti](https://img.shields.io/badge/RTX_5060_Ti-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
+| ![RTX 5090](https://img.shields.io/badge/RTX_5090-76B900?logo=nvidia&logoColor=white) 2026-10-03 | forward | forward + backward |
 |---|--:|--:|
-| **candle-fused-attn** | 1.419 | 4.973 |
-| PyTorch SDPA (memory-efficient, CUTLASS) | **0.945** | **4.814** |
-| PyTorch, composed (matmul, softmax, matmul) | 1.843 | 5.760 |
+| **candle-fused-attn** 0.2 | 0.226 | **0.885** |
+| PyTorch SDPA | **0.207** | 1.022 |
 
-The backward kernels are faster than SDPA's on both cards (5090: 0.597 against 0.767 ms;
-5060 Ti: 2.93 against 3.66 ms, SDPA's own gradient concatenation included). The forward is not:
-×1.09 SDPA's time on the 5090, ×1.5 on the 5060 Ti — enough on the 5060 Ti for SDPA to stay
-ahead forward + backward. Two differences could explain it, and which one dominates is not
-measured yet: SDPA runs its matmuls on tensor cores as 3xTF32 (fp32-accurate by splitting) where
-this crate uses plain FFMA, and it fits three 4-warp blocks per SM where this crate fits one
-8-warp block. A faster forward is the next release's work ([ROADMAP.md](ROADMAP.md)).
+**Accuracy** against fp64 (normwise relative error, dQ): candle-fused-attn 4.0e-7, SDPA 8.0e-7 —
+plain fp32 FMAs keep half SDPA's error. 0.3.0's outputs are bit-identical to 0.2.0's, and every
+rerun is bit-identical.
 
-**Accuracy** against an fp64 reference (normwise relative error; the same on both cards):
+**How it got fast** (the reasoning, every prediction and every rejected idea:
+[`docs/devlog.md`](docs/devlog.md)): the forward and the backward copy their next tiles with
+asynchronous loads while the current tile computes, so the GPU never waits on memory between
+tiles (forward −42.6 %, backward −14.3 % on the RTX 5060 Ti, outputs unchanged bit for bit).
 
-| | O | dQ | dK | dV |
-|---|--:|--:|--:|--:|
-| **candle-fused-attn** | 3.9e-7 | 4.0e-7 | 4.6e-7 | 4.4e-7 |
-| PyTorch SDPA (memory-efficient) | 5.7e-7 | 8.0e-7 | 8.0e-7 | 6.2e-7 |
-| PyTorch, composed | 3.9e-7 | 4.1e-7 | 4.1e-7 | 3.9e-7 |
-| fp64 rounded to fp32 (the floor) | 2.5e-8 | 2.5e-8 | 2.5e-8 | 2.5e-8 |
-
-**In a training step** — a 6-layer, 384-wide masked-diffusion model, RTX 5090, batch 128, same
-box, alternated rounds ([report](bench/results/2026-10-03-rtx5090-trainer-ab.md)): candle composed
-attention 87 ms, v0.1 79 ms, **v0.2 75 ms per step**.
+**In a training step**, against its PyTorch reference: from 5.1× slower (2026-07-29) to 0.93×
+— faster — on an RTX 5090 (2026-10-03), before this release's gains.
 
 ## Tutorial
 
