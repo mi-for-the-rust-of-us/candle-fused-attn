@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-04
+
+**Measured on three cards** (RTX 5060 Ti, 4090, 5090), 0.2.0 against 0.3.0 alternated in one
+session, outputs bit-identical: forward kernel −37 to −44 % inside training calls, backward −9 to
+−16 %, an attention training call −13 to −16 %; forward and forward + backward faster than PyTorch's
+fp32 SDPA in kernel time on all three. Every number and its report: `RESULTS.md`.
+
 ### Changed
 
 - **The forward overlaps its loads with its math** (devlog FA7). K and V tiles are copied with
@@ -27,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Machine section in every `bench/compare.py` report: the crate commit, the `nvcc` that built
   the PTX, candle-core's source, OS and driver model, CPU, GPU limits and states.
 - Build switch `CANDLE_FUSED_ATTN_SYNC_LOADS`: compiles the pre-8.0 load path on any card, to test it.
+- `bench/box.sh`: one card's whole measurement (0.2.0 against the checkout, bit for bit and in
+  time, and against PyTorch), as run on the three cards.
+- `RESULTS.md`: every published number, per card and date, with its report; `docs/devlog.md`: every
+  measurement registered before it ran, its result, and the rejected ideas.
+
+### Documentation
+
+- Limits: CUDA 13 toolkits no longer compile for Volta (compute capability 7.0); on a V100, build
+  with CUDA 12. The code still supports it (ordinary loads below 8.0).
 
 ## [0.2.0] - 2026-10-03
 
