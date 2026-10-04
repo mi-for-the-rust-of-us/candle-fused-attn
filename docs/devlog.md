@@ -18,6 +18,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA5](#fa5--the-first-profile-both-forward-kernels-at-the-canvas-shape) | 2026-10-04 | why is our forward slower? | P1, P4, P5 **met**; P2 **missed** (SDPA has OUR occupancy); P3 **half missed** (top stall: global loads) |
 | [FA6](#fa6--design-the-forwards-levers-ranked-with-predicted-gains) | 2026-10-04 | which levers, in which order? | design |
 | [FA7](#fa7--lever-l1-asynchronous-kv-loads-overlapped-with-the-math) | 2026-10-04 | does overlapping the K/V loads with the math close the gap? | P1, P3, P5 **met**; P2 **missed high** (−42.6 %); P4 half missed (114 registers) — **kept** |
+| [FA8](#fa8--the-backward-kernel-profiled-before-any-change) | 2026-10-04 | where does the backward kernel's time go? | registered |
 
 ---
 
@@ -371,3 +372,40 @@ tiles, against the remaining short-scoreboard stall) is registered next, on L1's
 
 **For the release notes.** The README's "compute capability 7.0 (Volta) or newer" holds only with
 a CUDA 12 toolkit; with CUDA 13 the buildable floor is 7.5 (Turing).
+
+---
+
+## FA8 — the backward kernel, profiled before any change
+
+*Registered 2026-10-04, before the run. Why now: per training step at batch 64, attention costs
+about 18 forward calls × 0.85 ms (after FA7) against 6 backward calls × 2.95 ms — the backward is
+now the larger share, and it loads its Q and dO tiles inside its query loop the same exposed way
+v0.2's forward did.*
+
+**Protocol.** As FA5: Nsight Compute 2026.3.1, `--set full`, one launch after the warm-up calls,
+FA1's inputs (canvas shape), `compare.py`'s `nsys` mode in the `train` phase: our
+`fattn_bwd_f32_d64` (crate `26eb8bb`, the backward untouched since v0.2) and SDPA's
+`fmha_cutlassB_f32_aligned_64x64_k64_sm80`. A few seconds of GPU each.
+
+**What the kernel does (v0.2, unchanged).** One block per key block of 64 keys (K, V loaded once);
+it walks query tiles of 32: per tile it loads Q and dO with ordinary loads (`load_tile4`), reads
+L and D, computes S, dP, P, dS, accumulates dK and dV in registers, then adds its dQ partial into
+global memory **on its turn** (thread 0 spins on an acquire load until the previous key block has
+passed the turn; the block waits at a barrier).
+
+**Predictions.**
+- **P1:** occupancy 1 block = 8 warps per SM (69,632 B of shared memory), achieved 14–16.7 %.
+- **P2:** long scoreboard is one of the two top stalls (≥ 1.0 warp-cycles per issued
+  instruction): the Q / dO tile loads and the dQ read through L2 (`__ldcg`).
+- **P3:** barrier is among the top three stalls (≥ 0.5): every thread waits while thread 0 spins
+  for the dQ turn.
+- **P4:** compute (SM) throughput ≤ 40 %.
+- **P5:** SDPA's backward runs on the tensor pipe (TF32), and ours does not.
+
+**Decision rule (fixed now).**
+- Long scoreboard the top stall → the next lever is FA7's, for the backward: Q and dO of the next
+  query tile copied with `cp.async` while the current one computes (registered as its own entry,
+  with the bitwise gate).
+- Barrier the top stall → the dQ turn order is the bottleneck; that lever (how blocks hand over
+  dQ) is designed first.
+- Neither → read the profile before anything is registered.

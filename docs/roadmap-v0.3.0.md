@@ -35,5 +35,6 @@ its status; every measurement — registered before it runs, then its result —
 | 1 | profiling both forwards | [FA5](devlog.md#fa5--the-first-profile-both-forward-kernels-at-the-canvas-shape) | done — same occupancy as SDPA; ours waits on global loads |
 | 1 | design: a predicted gain per lever | [FA6](devlog.md#fa6--design-the-forwards-levers-ranked-with-predicted-gains) | done — L1 async loads, L2 register tiles, L3 occupancy |
 | 2 | L1: asynchronous K/V loads | [FA7](devlog.md#fa7--lever-l1-asynchronous-kv-loads-overlapped-with-the-math) | done — forward −42.6 %, bitwise identical, faster than SDPA's forward on the 5060 Ti |
-| 2 | L2: larger register tiles | — | next (to be registered on L1's profile) |
+| 2 | the backward, profiled | [FA8](devlog.md#fa8--the-backward-kernel-profiled-before-any-change) | registered |
+| 2 | L2: larger register tiles (forward) | — | after the backward |
 | 3 | rented RTX 5090 + RTX 4090, release | — | — |
