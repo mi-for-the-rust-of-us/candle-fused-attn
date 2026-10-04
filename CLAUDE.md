@@ -105,6 +105,10 @@ caught a script committed without its executable bit, which would have failed th
   `git update-index --chmod=+x` for every script a workflow runs directly (`ci-local.sh` checks).
 - **Synced sources keep old modification times** (`tar`), so cargo does not rebuild: `touch` them.
 - **A fresh binary's first run includes kernel JIT**: discard it in any timing.
+- **Keep the reference binary before changing the code** (`cp` it out of `target/`): the next
+  build overwrites it, and an A/B needs it. An md5 identifies a binary only until it is relinked
+  (the Windows linker stamps a time in every executable); a rebuilt reference is re-checked with
+  `bench/bitwise.py`.
 
 ## Shell Environment
 

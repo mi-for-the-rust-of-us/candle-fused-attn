@@ -19,7 +19,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA6](#fa6--design-the-forwards-levers-ranked-with-predicted-gains) | 2026-10-04 | which levers, in which order? | design |
 | [FA7](#fa7--lever-l1-asynchronous-kv-loads-overlapped-with-the-math) | 2026-10-04 | does overlapping the K/V loads with the math close the gap? | P1, P3, P5 **met**; P2 **missed high** (−42.6 %); P4 half missed (114 registers) — **kept** |
 | [FA8](#fa8--the-backward-kernel-profiled-before-any-change) | 2026-10-04 | where does the backward kernel's time go? | P1, P2, P4, P5 **met**; P3 **missed** narrowly (barrier 4th) |
-| [FA9](#fa9--lever-l1-for-the-backward-q-do-l-and-d-of-the-next-query-tile-loaded-during-this-one) | 2026-10-04 | does prefetching the next query tile speed the backward? | registered |
+| [FA9](#fa9--lever-l1-for-the-backward-q-do-l-and-d-of-the-next-query-tile-loaded-during-this-one) | 2026-10-04 | does prefetching the next query tile speed the backward? | **all met**: backward −14.3 %, bitwise identical — **kept** |
 
 ---
 
@@ -480,3 +480,23 @@ registered design — both Q and dO double-buffered — because in our kernel dO
 so a single dO buffer would overlap phase 3 only; FA-2's choice saves 8,704 B that we do not need
 (one block per SM either way). The `REFERENCE` comment in the code will say both.
 
+### FA9 — RESULT (2026-10-04, ~10:00): backward −14.3 %, bitwise identical; every prediction met
+
+Code: `487b4f2`. Report: [`2026-10-04-rtx5060ti-ab-l1-vs-fa9.md`](../bench/results/2026-10-04-rtx5060ti-ab-l1-vs-fa9.md);
+profile `profiles/2026-10-04-rtx5060ti-bwd-candle-fused-attn-fa9.ncu-repz`. GPU used: ~2 min.
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1: bitwise identity | dQ, dK, dV, O; native and fallback | **identical** (6 shapes × 2 entry points; native, forced fallback) | met |
+| P2: backward kernel, alternated vs L1 | −8 to −18 %; forward ±2 % | **−14.3 %** (2.950 → 2.527 ms); forward −0.1 % in the training call, +1.5 % alone (not separated) | met |
+| P3: long scoreboard | ≤ 0.5; top stall short scoreboard or MIO throttle | **0.43**; top stall short scoreboard (1.28) | met |
+| P4: shared memory; registers; occupancy | 87,552 B; ≤ 168; unchanged | 87,552 B; 128; 16.64 % | met |
+
+Also: barrier stall 0.66 → 0.38 (one barrier per tile fewer), compute throughput 34.9 → 42.2 %,
+warp cycles between issues 5.96 → 5.07; a whole training call −7.2 % (every FA9 round faster).
+The remaining top stall in both kernels is now shared-memory latency (short scoreboard): **L2,
+larger register tiles, is next, designed for both kernels**.
+
+**Procedure note.** The build of FA9 overwrote the L1 `compare.exe` that the A/B needed as its
+reference; L1 was rebuilt from its commit and checked bitwise identical before use. Binaries are
+not identified by md5 across links on Windows (the linker stamps a time in every executable).

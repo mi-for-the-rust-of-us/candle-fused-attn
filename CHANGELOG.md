@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape, alternated with 0.2.0 in one session: forward kernel 1.480 → 0.850 ms (−42.6 %), now
   below PyTorch's fp32 SDPA forward (0.859 against 0.964 ms in one session). Below 8.0 the
   ordinary loads remain.
+- **The backward overlaps its loads with its math too** (devlog FA9): the next query tile's Q, dO,
+  L and D are copied with `cp.async` while the current one computes (Q and dO double-buffered;
+  shared memory 87,552 B per block). Outputs bitwise identical; backward kernel −14.3 % against
+  the forward-only change, alternated, RTX 5060 Ti.
 
 ### Added
 
