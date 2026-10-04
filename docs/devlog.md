@@ -469,3 +469,14 @@ under `-DFATTN_SYNC_LOADS`), the same double-buffered schedule with ordinary loa
 **Decision rule (fixed now).** P1 is a gate. Keep at ≥ 5 % on the backward kernel; below 3 %,
 revert with a `MEASURED-REVERT` note. Then L2 (register tiles), designed for both kernels at once,
 since both are now limited by shared-memory traffic.
+
+**Correction to FA9's REFERENCE (2026-10-04, read after registering, before any code).** Read
+upstream (`Dao-AILab/flash-attention`, `csrc/flash_attn/src/flash_bwd_kernel.h`, main loop):
+FA-2's `Double_buffer` applies to **sQ only** (`tQsQ` alternates between two halves every
+`m_block`); **dO is single-buffered** and its next tile is copied right after its last use (the
+dV GEMM, behind a `__syncthreads` "since we're writing to the same sdO location"), so that copy
+overlaps the dQ and dK GEMMs; the next tile's LSE is read into registers in the loop. FA9 keeps its
+registered design — both Q and dO double-buffered — because in our kernel dO's last use is phase 2,
+so a single dO buffer would overlap phase 3 only; FA-2's choice saves 8,704 B that we do not need
+(one block per SM either way). The `REFERENCE` comment in the code will say both.
+
