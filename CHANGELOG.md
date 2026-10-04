@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The forward overlaps its loads with its math** (devlog FA7). K and V tiles are copied with
+  `cp.async` (compute capability 8.0+) in FlashAttention-2's order: V(n) arrives while QKᵀ is
+  computed, K(n+1) while PV is. Outputs are **bitwise identical** to 0.2.0. RTX 5060 Ti, canvas
+  shape, alternated with 0.2.0 in one session: forward kernel 1.480 → 0.850 ms (−42.6 %), now
+  below PyTorch's fp32 SDPA forward (0.859 against 0.964 ms in one session). Below 8.0 the
+  ordinary loads remain.
+
+### Added
+
+- `bench/bitwise.py` (a bit-for-bit gate between two builds over a fixed set of shapes) and
+  `bench/ab.py` (two builds' kernel times, alternated in one session).
+- A Machine section in every `bench/compare.py` report: the crate commit, the `nvcc` that built
+  the PTX, candle-core's source, OS and driver model, CPU, GPU limits and states.
+- Build switch `CANDLE_FUSED_ATTN_SYNC_LOADS`: compiles the pre-8.0 load path on any card, to test it.
+
 ## [0.2.0] - 2026-10-03
 
 ### Changed

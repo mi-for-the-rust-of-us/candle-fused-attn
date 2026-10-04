@@ -16,8 +16,8 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA3](#fa3--the-profiler-is-ready-v030-phase-0c) | 2026-10-04 | can Nsight Compute profile the 5060 Ti? | **yes**, after opening the counters |
 | [FA4](#fa4--reading-sdpas-fp32-forward-pytorch-v210) | 2026-10-04 | how is SDPA's fp32 forward built? | reading: tensor cores (3xTF32); its "3 blocks per SM" does not hold on the 5060 Ti (FA5) |
 | [FA5](#fa5--the-first-profile-both-forward-kernels-at-the-canvas-shape) | 2026-10-04 | why is our forward slower? | P1, P4, P5 **met**; P2 **missed** (SDPA has OUR occupancy); P3 **half missed** (top stall: global loads) |
-| [FA6](#fa6--design-the-forwards-levers-ranked-with-predicted-gains) | 2026-10-04 | which levers, in which order? | design (registered) |
-| [FA7](#fa7--lever-l1-asynchronous-kv-loads-overlapped-with-the-math) | 2026-10-04 | does overlapping the K/V loads with the math close the gap? | registered |
+| [FA6](#fa6--design-the-forwards-levers-ranked-with-predicted-gains) | 2026-10-04 | which levers, in which order? | design |
+| [FA7](#fa7--lever-l1-asynchronous-kv-loads-overlapped-with-the-math) | 2026-10-04 | does overlapping the K/V loads with the math close the gap? | P1, P3, P5 **met**; P2 **missed high** (−42.6 %); P4 half missed (114 registers) — **kept** |
 
 ---
 
@@ -327,3 +327,47 @@ same arithmetic in the same order. Under `__CUDA_ARCH__ < 800`, the v0.2 loads, 
 **Decision rule (fixed now).** P1 is a gate: any bit difference stops the lever until explained.
 If P2 shows ≥ 10 %, L1 is kept and L2 is registered on L1's profile. Below 5 %, L1 is reverted
 with a `MEASURED-REVERT` note and the profile is re-read before anything else is tried.
+
+### FA7 — RESULT (2026-10-04, ~09:15): −42.6 % on the forward, bitwise identical; faster than SDPA's forward on the 5060 Ti
+
+Code: `aef44b9`. Reports: [`2026-10-04-rtx5060ti-ab-v0.2-vs-l1.md`](../bench/results/2026-10-04-rtx5060ti-ab-v0.2-vs-l1.md)
+(the A/B), [`2026-10-04-rtx5060ti-compare-l1.md`](../bench/results/2026-10-04-rtx5060ti-compare-l1.md)
+(against PyTorch, same session); profile `profiles/2026-10-04-rtx5060ti-fwd-candle-fused-attn-l1.ncu-repz`.
+GPU used: ~5 min in all, as priced.
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1: bitwise identity with v0.2 | every input, native and fallback | **identical**, 6 shapes × 2 entry points × (`o`, `dqkv`), native build and forced-fallback build; the gate's negative control catches a one-ulp change | met |
+| P2: forward kernel time vs v0.2, same session | −15 to −30 % | **−42.6 %** (1.480 → 0.850 ms; every L1 round below every v0.2 round) | **missed high** |
+| P3: long-scoreboard stall | ≤ 0.8; top stall becomes short scoreboard or barrier | **0.18**; top stall short scoreboard (1.07) | met |
+| P4: shared memory; registers | 69,632 B; ≤ 96 | 69,632 B; **114** (still 1 block per SM, set by shared memory) | half missed |
+| P5: backward kernels | ±2 % | +0.3 % (`fattn_bwd_f32_d64`), −0.1 % (`fattn_bwd_dot_f32_d64`) | met |
+
+Under Nsight Compute (v0.2 → L1): compute throughput 29.7 → **51.2 %**, warp cycles between
+issues 6.50 → 3.82, FMA pipe 22 → 38 %, LSU pipe 24 → 44 %; global loads 414,720 → 0 (now
+`cp.async`); shared loads unchanged (12.58 M), as the arithmetic is unchanged.
+
+**Against PyTorch, same session** (`compare.py`): forward kernel time **0.859 ms against SDPA's
+0.964** (×1.12 in our favour); forward + backward net 4.518 against 5.021 ms. Wall time: forward
+0.837 against 0.970 ms (faster by the decision rule, ×1.16); training call, SDPA ahead (×1.29: the
+training call includes candle's loss head and glue around the op); net of the head, not separated
+(4.838 against 4.872 ms). **On the RTX 5060 Ti, v0.3.0's "done when" is met for the forward**; the
+RTX 5090 is measured in Phase 3.
+
+**Decision (the registered rule).** P1 holds and P2 ≥ 10 %: **L1 is kept**. L2 (larger register
+tiles, against the remaining short-scoreboard stall) is registered next, on L1's profile.
+
+**Deviations from the registration, recorded.**
+- Step 2 registered the fallback as a build for compute capability 7.0. **CUDA 13.1's nvcc no
+  longer targets compute 7.0 or 7.2** (`Unsupported gpu architecture`), and candle's own kernels do
+  not compile for 7.5 with it (`candle-kernels/src/compatibility.cuh` redefines `__hmax_nan` /
+  `__hmin_nan`, which CUDA 13.1's `cuda_fp16.hpp` now provides — an upstream candle issue). The
+  fallback was instead compiled on the native target with `-DFATTN_SYNC_LOADS` (a test switch,
+  `build.rs`: `$CANDLE_FUSED_ATTN_SYNC_LOADS`), which selects the same code a card below 8.0
+  runs; our kernel alone, compiled for compute 7.5 with nvcc, has no `cp.async`, so the guard
+  selects that path there.
+- Observed, unrelated to L1: nvcc warns `#221-D` on `-INFINITY` (it expands to
+  `-((float)(1e+300))` here); the value is still −∞, and the warning predates L1.
+
+**For the release notes.** The README's "compute capability 7.0 (Volta) or newer" holds only with
+a CUDA 12 toolkit; with CUDA 13 the buildable floor is 7.5 (Turing).
