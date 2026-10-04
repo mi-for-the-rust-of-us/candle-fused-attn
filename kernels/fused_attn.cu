@@ -94,6 +94,46 @@ __device__ __forceinline__ void load_tile4(float* dst, const float* __restrict__
   }
 }
 
+// Asynchronous tile loads, for the forward's K/V pipeline (devlog FA7). On compute capability 8.0+
+// `cp.async.cg` copies 16 bytes from global to shared memory without staging them in registers,
+// so the issuing thread does not wait for them; `cp_async_commit` closes this thread's group of
+// copies and `cp_async_wait_all` waits for its groups (a `__syncthreads` must follow before other
+// threads read the tile). Rows past `seq` are zero-filled with a source size of 0 (nothing is
+// read; the address given is row `row0`, always inside the slice). Below 8.0 the copies are
+// load_tile4's ordinary loads and commit / wait are empty: the same tile, the same arithmetic.
+// `-DFATTN_SYNC_LOADS` (build.rs: $CANDLE_FUSED_ATTN_SYNC_LOADS) forces that path on any card, to
+// test it.
+// REFERENCE: kernel_traits.h (FlashAttention-2, as vendored in candle-flash-attn) --
+// SM80_CP_ASYNC_CACHEGLOBAL<uint128_t> copies when __CUDA_ARCH__ >= 800, ordinary ones below.
+__device__ __forceinline__ void load_tile_async(float* dst, const float* __restrict__ src,
+                                                int64_t s_stride, int row0, int rows, int seq) {
+#if __CUDA_ARCH__ >= 800 && !defined(FATTN_SYNC_LOADS)
+  for (int idx = threadIdx.x; idx < rows * (HD / 4); idx += NT) {
+    const int r = idx / (HD / 4), c4 = idx % (HD / 4);
+    const int row = row0 + r;
+    const float* g = src + (int64_t)(row < seq ? row : row0) * s_stride + 4 * c4;
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(dst + r * LD + 4 * c4));
+    const int bytes = row < seq ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(g), "r"(bytes)
+                 : "memory");
+  }
+#else
+  load_tile4(dst, src, s_stride, row0, rows, seq);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800 && !defined(FATTN_SYNC_LOADS)
+  asm volatile("cp.async.commit_group;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+#if __CUDA_ARCH__ >= 800 && !defined(FATTN_SYNC_LOADS)
+  asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+#endif
+}
+
 // The dQ turn of one query tile: wait until `kb` key blocks have added theirs (thread 0 spins,
 // acquire at GPU scope), then pass it on (release).
 // REFERENCE: `AtomicLock` in kernel_backward.h (PyTorch v2.10, mem_eff_attention) -- the
@@ -313,9 +353,13 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
 //   phase 2: the SAME thread owns rows 4ty .. +4 and dims 4tx .. +4 of the O accumulator, so the
 //            rescale by exp(m_old - m_new) and the final 1/l never cross threads.
 // Out: o [b, s, h, d] (the merge-heads layout) and lse [b, h, s], the backward's saved state.
+// Loads overlap the math (devlog FA7): V(n) travels while phase 1 computes S from K(n), and
+// K(n + 1) travels while phase 2 consumes V(n); one K and one V buffer suffice, because each is
+// refilled only after the barrier that ends its last read.
 // REFERENCE: flash_fwd_kernel.h (FlashAttention-2, as vendored in candle-flash-attn) -- key tiles
-// walked with an online softmax, only O and L written; departs on the arithmetic: fp32 FFMA on
-// CUDA cores, no tensor cores (FA-2 is f16/bf16 only).
+// walked with an online softmax, only O and L written, and the main loop's load schedule (lines
+// 414-470: V issued before the QK^T gemm, the next K before softmax and PV); departs on the
+// arithmetic: fp32 FFMA on CUDA cores, no tensor cores (FA-2 is f16/bf16 only).
 // Shared memory: dynamic, (2 FW_QRYS + 2 FW_KEYS) LD floats = 69,632 B (68 KB; TWIN:
 // src/cuda.rs:FWD_SMEM): one block per SM on the RTX 5060 Ti (measured).
 // ------------------------------------------------------------------------------------------------
@@ -358,7 +402,13 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
   const float* kp = k + b * k_sb + h * k_sh;
   const float* vp = v + b * v_sb + h * v_sh;
 
-  load_tile4(Qs, q + b * q_sb + h * q_sh, q_ss, q0, FW_QRYS, S);
+  // Causal: keys past the block's last query never contribute.
+  const int k_end = causal ? min(S, q0 + FW_QRYS) : S;
+
+  // Prologue: Q and the first key tile, one group of copies.
+  load_tile_async(Qs, q + b * q_sb + h * q_sh, q_ss, q0, FW_QRYS, S);
+  load_tile_async(Ks, kp, k_ss, 0, FW_KEYS, S);
+  cp_async_commit();
 
   float m[4], l[4], acc[4][4];
 #pragma unroll
@@ -369,13 +419,13 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
     for (int e = 0; e < 4; ++e) acc[r][e] = 0.0f;
   }
 
-  // Causal: keys past the block's last query never contribute.
-  const int k_end = causal ? min(S, q0 + FW_QRYS) : S;
   for (int k0 = 0; k0 < k_end; k0 += FW_KEYS) {
-    __syncthreads();  // the previous tile's Ks/Vs/Ps are no longer read
-    load_tile4(Ks, kp, k_ss, k0, FW_KEYS, S);
-    load_tile4(Vs, vp, v_ss, k0, FW_KEYS, S);
+    // K(k0) (and, the first time, Q) has landed for every thread, and every thread is done with
+    // the previous tile's Vs and Ps (its phase 2): V(k0) may now overwrite Vs.
+    cp_async_wait_all();
     __syncthreads();
+    load_tile_async(Vs, vp, v_ss, k0, FW_KEYS, S);  // travels during phase 1
+    cp_async_commit();
 
     float s[4][4];
 #pragma unroll
@@ -422,7 +472,14 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_fwd_f32_d64(
 #pragma unroll
       for (int e = 0; e < 4; ++e) acc[r][e] *= alpha;
     }
+    // V(k0) has landed for every thread, every P is written, and every thread is done with Ks
+    // (its phase 1): K(k0 + FW_KEYS) may now overwrite Ks.
+    cp_async_wait_all();
     __syncthreads();
+    if (k0 + FW_KEYS < k_end) {
+      load_tile_async(Ks, kp, k_ss, k0 + FW_KEYS, FW_KEYS, S);  // travels during phase 2
+      cp_async_commit();
+    }
 
     // O[i] += sum_j P[i][j] V[j], four keys at a time
 #pragma unroll 2
