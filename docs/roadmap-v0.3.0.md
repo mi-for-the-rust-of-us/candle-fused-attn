@@ -32,7 +32,7 @@ its status; every measurement — registered before it runs, then its result —
 | 0 | 0b: attention's share of an evaluation | [FA2](devlog.md#fa2--attentions-share-of-a-canvas-evaluation-v030-phase-0b) | done — local evals moved to the fused binary |
 | 0 | 0c: a profiler for Blackwell | [FA3](devlog.md#fa3--the-profiler-is-ready-v030-phase-0c) | done |
 | 1 | reading SDPA's forward | [FA4](devlog.md#fa4--reading-sdpas-fp32-forward-pytorch-v210) | done |
-| 1 | profiling both forwards | [FA5](devlog.md#fa5--the-first-profile-both-forward-kernels-at-the-canvas-shape) | registered |
+| 1 | profiling both forwards | [FA5](devlog.md#fa5--the-first-profile-both-forward-kernels-at-the-canvas-shape) | done — same occupancy as SDPA; ours waits on global loads |
 | 1 | design: a predicted gain per lever | — | next |
 | 2 | local iteration | — | — |
 | 3 | rented RTX 5090 + RTX 4090, release | — | — |

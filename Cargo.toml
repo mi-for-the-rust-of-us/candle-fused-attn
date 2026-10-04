@@ -15,7 +15,7 @@ homepage = "https://github.com/mi-for-the-rust-of-us/candle-fused-attn"
 documentation = "https://docs.rs/candle-fused-attn"
 readme = "README.md"
 # The benchmark's outputs and local Python caches are not part of the crate.
-exclude = ["target/", "bench/__pycache__/", ".github/"]
+exclude = ["target/", "bench/__pycache__/", "bench/results/profiles/", ".github/"]
 
 [dependencies]
 candle-core = "0.11"

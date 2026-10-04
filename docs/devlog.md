@@ -14,8 +14,8 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA1](#fa1--the-v02-baseline-on-the-rtx-5060-ti-v030-phase-0a) | 2026-10-04 | does the v0.2 baseline reproduce 2026-10-03? | **met** (all within 5 %) |
 | [FA2](#fa2--attentions-share-of-a-canvas-evaluation-v030-phase-0b) | 2026-10-04 | what share of an evaluation is the fused forward? is the fused binary faster? | P1 **missed** low (18.5 %); P2, P3 **met** |
 | [FA3](#fa3--the-profiler-is-ready-v030-phase-0c) | 2026-10-04 | can Nsight Compute profile the 5060 Ti? | **yes**, after opening the counters |
-| [FA4](#fa4--reading-sdpas-fp32-forward-pytorch-v210) | 2026-10-04 | how is SDPA's fp32 forward built? | reading: tensor cores **and** 3× the occupancy |
-| [FA5](#fa5--the-first-profile-both-forward-kernels-at-the-canvas-shape) | 2026-10-04 | why is our forward slower? | registered |
+| [FA4](#fa4--reading-sdpas-fp32-forward-pytorch-v210) | 2026-10-04 | how is SDPA's fp32 forward built? | reading: tensor cores (3xTF32); its "3 blocks per SM" does not hold on the 5060 Ti (FA5) |
+| [FA5](#fa5--the-first-profile-both-forward-kernels-at-the-canvas-shape) | 2026-10-04 | why is our forward slower? | P1, P4, P5 **met**; P2 **missed** (SDPA has OUR occupancy); P3 **half missed** (top stall: global loads) |
 
 ---
 
@@ -216,3 +216,43 @@ Reports kept as `.ncu-rep`; the numbers below are read from them and summarised 
 - top stall barrier → restructure the synchronisation between phases first;
 - FMA pipe already busy ≥ 50 % → occupancy will not help: raise arithmetic intensity first
   (larger per-thread register tiles).
+
+### FA5 — RESULT (2026-10-04, 08:12): same occupancy as SDPA; our warps wait on global loads
+
+Report: [`bench/results/2026-10-04-rtx5060ti-ncu-forward.md`](../bench/results/2026-10-04-rtx5060ti-ncu-forward.md);
+raw `.ncu-repz` under `bench/results/profiles/`. ~42 s of profiling, as priced.
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1: our occupancy | 8 of 48 warps theoretical (16.7 %), 13–16.7 % achieved | 16.67 % / **16.35 %**, shared-memory-limited (1 block) | met |
+| P2: SDPA | 128 threads, ≤ 34 KB shared memory, ≥ 12 warps per SM | 128 threads, **36,352 B**, **8 warps per SM** (2 blocks: shared-memory-limited) | **missed** |
+| P3: our top stall; FMA pipe | shared memory or sync; FMA < 35 % | **long scoreboard** (global loads) 2.25, then short scoreboard 1.74; FMA pipes 22–25 % | **half missed** |
+| P4: tensor cores; our mix | SDPA MMA, ours none; ours FFMA + LDS | SDPA 19.33 G TF32 ops, tensor pipe 42 %; ours 0; ours FMA and LSU pipes ~24 % each | met |
+| P5: registers | ours 64–128; SDPA ≤ 168 | 80; 168 | met |
+
+**What it says.**
+- **Occupancy is not the difference on this card.** SDPA's block needs 36,352 B of shared memory,
+  so only 2 of its "minimum 3" blocks fit in the 5060 Ti's 100 KB: both kernels run 8 warps per SM.
+  SDPA turns them into 86 % compute throughput, mostly the tensor pipe (math-pipe throttle is its
+  top stall: a saturated pipe, the sign of a well-fed kernel); ours, 30 %.
+- **Our warps wait on memory, first global then shared.** Each key tile is loaded from global
+  memory into shared memory by ordinary loads, then the block synchronises and computes: nothing
+  overlaps the next tile's load with the current tile's math, and 8 warps per SM are too few to
+  hide that latency by switching (long scoreboard, 2.25). Then every product reads its operands
+  from shared memory (12.6 M shared loads against SDPA's 3.6 M; short scoreboard, 1.74). Our
+  shared-memory layout itself is clean: 2.4 K bank conflicts against SDPA's 1.7 M.
+- **3xTF32 confirmed to the operation:** 19.33 G TF32 operations = 3 × 6.44 GFLOP, the forward's
+  arithmetic on tiles padded from s = 240 to 256.
+
+**The registered decision rule.** Its first branch (occupancy shared-memory-limited **and** top
+stall shared-memory traffic) half applies: occupancy is shared-memory-limited, but the top stall is
+global-memory latency, a case the rule did not foresee. So the rule does not rank the levers by
+itself, and the ranking goes to Phase 1's design entry, to be registered before any code:
+latency hiding (asynchronous `cp.async` copies with double buffering, so the next tile loads while
+this one computes — what CUTLASS and FlashAttention-2 do), fewer shared-memory loads per FFMA
+(larger per-thread register tiles), and occupancy (it would also hide latency).
+
+**Correction to FA4 (2026-10-04, after FA5).** FA4 read `kMinBlocksPerSm = 3` as "at least 3
+blocks, 12 warps, per SM by design". It is a `__launch_bounds__` hint to the compiler (it caps
+registers so that 3 blocks could fit); on the RTX 5060 Ti, shared memory admits only 2 blocks of
+SDPA's forward, so it runs 8 warps per SM, like ours.
