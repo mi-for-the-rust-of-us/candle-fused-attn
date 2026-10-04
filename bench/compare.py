@@ -46,6 +46,7 @@ import csv
 import io
 import json
 import os
+import platform
 import shutil
 import statistics
 import subprocess
@@ -181,6 +182,84 @@ def fmt_range(xs: list[float]) -> str:
   '1.250 [1.000–1.500]'
   """
   return f"{statistics.median(xs):.3f} [{min(xs):.3f}–{max(xs):.3f}]"
+
+
+def package_version(toml_text: str) -> str:
+  """The `version` of a `Cargo.toml`'s `[package]` table (another table's `version` is skipped).
+
+  >>> toml = '[package]\\nname = "x"\\nversion = "0.2.0"\\n'
+  >>> package_version(toml + '[dependencies]\\nversion = "9"\\n')
+  '0.2.0'
+  >>> package_version("[workspace]\\n")
+  'unknown'
+  """
+  table = None
+  for line in toml_text.splitlines():
+    s = line.strip()
+    if s.startswith("["):
+      table = s
+    elif table == "[package]" and s.startswith("version") and "=" in s:
+      return s.split("=", 1)[1].strip().strip('"')
+  return "unknown"
+
+
+def lock_entry(lock_text: str, name: str) -> str:
+  """How a `Cargo.lock` resolves package `name`: version and source. A `[patch]` to a local path
+  leaves the entry without a `source` line, which is how a patched candle fork shows.
+
+  >>> reg = 'source = "registry+https://github.com/rust-lang/crates.io-index"\\n'
+  >>> lock = '[[package]]\\nname = "candle-core"\\nversion = "0.11.0"\\n' + reg
+  >>> lock_entry(lock, "candle-core")
+  '0.11.0 (crates.io)'
+  >>> lock_entry(lock.replace(reg, ""), "candle-core")
+  '0.11.0 (local path, through [patch])'
+  >>> lock_entry(lock, "zip")
+  'not in Cargo.lock'
+  """
+  found = []
+  for block in lock_text.split("[[package]]")[1:]:
+    fields = {}
+    for line in block.splitlines():
+      if " = " in line:
+        key, value = line.split(" = ", 1)
+        fields[key.strip()] = value.strip().strip('"')
+    if fields.get("name") == name:
+      source = fields.get("source", "")
+      where = ("crates.io" if "crates.io-index" in source else source.split("+")[0] if source
+               else "local path, through [patch]")
+      found.append(f"{fields.get('version', '?')} ({where})")
+  return "; ".join(found) or "not in Cargo.lock"
+
+
+def nvcc_release(text: str) -> str:
+  """The release of an `nvcc --version` output; any other text (a capture failure) unchanged.
+
+  >>> nvcc_release("nvcc: NVIDIA (R) Cuda compiler driver\\n"
+  ...              "Cuda compilation tools, release 13.1, V13.1.115\\n")
+  '13.1 (V13.1.115)'
+  >>> nvcc_release("unavailable: no nvcc")
+  'unavailable: no nvcc'
+  """
+  for line in text.splitlines():
+    if "release" in line and "," in line:
+      parts = [p.strip() for p in line.split(",")]
+      release = next((p.split()[-1] for p in parts if p.startswith("release")), "?")
+      return f"{release} ({parts[-1]})"
+  return text
+
+
+def cpuinfo_model(text: str) -> str:
+  """The first `model name` of a Linux `/proc/cpuinfo`.
+
+  >>> cpuinfo_model("processor\\t: 0\\nmodel name\\t: AMD EPYC 7B13 64-Core Processor\\n")
+  'AMD EPYC 7B13 64-Core Processor'
+  >>> cpuinfo_model("")
+  'unknown'
+  """
+  for line in text.splitlines():
+    if line.startswith("model name") and ":" in line:
+      return line.split(":", 1)[1].strip()
+  return "unknown"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -369,6 +448,51 @@ def gpu_state() -> str:
                   "power.draw", "--format=csv,noheader"])
 
 
+def crate_commit() -> str:
+  """The crate's commit; on a copy without `.git` (a synced tree on a rented box),
+  `$CANDLE_FUSED_ATTN_COMMIT`, else a note saying it is unknown."""
+  commit = capture(["git", "-C", str(CRATE), "describe", "--always", "--dirty"])
+  if not commit.startswith("unavailable"):
+    return commit
+  return os.environ.get("CANDLE_FUSED_ATTN_COMMIT",
+                        "unknown (no .git; set $CANDLE_FUSED_ATTN_COMMIT)")
+
+
+def cpu_name() -> str:
+  """The host CPU's name (some phases of a run are host-bound)."""
+  if os.name == "nt":
+    return capture(["powershell", "-NoProfile", "-Command",
+                    "(Get-CimInstance Win32_Processor).Name"])
+  try:
+    return cpuinfo_model(Path("/proc/cpuinfo").read_text(encoding="utf-8"))
+  except OSError:
+    return platform.processor() or "unknown"
+
+
+def machine() -> dict[str, object]:
+  """Everything about the machine that can change a timing: the crate and the toolchain that
+  built its PTX (the driver compiles that PTX at load, so both are part of the timed code), the
+  candle it was built against, the OS and driver model, the CPU, the GPU's limits."""
+
+  def smi(query: str) -> str:
+    return capture(["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader"])
+
+  lock = CRATE / "Cargo.lock"
+  return {
+    "crate": f"{package_version((CRATE / 'Cargo.toml').read_text(encoding='utf-8'))} "
+             f"at {crate_commit()}",
+    "nvcc_on_path": nvcc_release(capture(["nvcc", "--version"])),
+    "cuda_env": {k: os.environ[k] for k in ("CUDA_PATH", "CUDA_COMPUTE_CAP", "NVCC")
+                 if k in os.environ},
+    "candle_core": lock_entry(lock.read_text(encoding="utf-8"), "candle-core")
+                   if lock.is_file() else "no Cargo.lock",
+    "os": platform.platform(),
+    "driver_model": smi("driver_model.current"),
+    "cpu": cpu_name(),
+    "gpu_limits": smi("power.limit,clocks.max.sm,clocks.max.mem"),
+  }
+
+
 def make_inputs(path: Path, b: int, h: int, s: int, seed: int) -> None:
   """Seeded `qkv` `[b, s, 3·h·64]` and `dout` `[b, s, h·64]`, N(0, 1) fp32, drawn on the CPU."""
   import torch
@@ -434,6 +558,7 @@ def run(a: argparse.Namespace) -> None:
            ["git", "-C", str(CRATE), "describe", "--always", "--dirty"]),
          "driver": capture(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]),
          "gpu_memory_holders": capture(["hmn", "ps"]),
+         "machine": machine(), "gpu_start": gpu_state(),
          "timing": {"rounds": a.rounds, "samples": a.samples, "calls": a.calls,
                     "warmup": a.warmup, "nsys_calls": a.nsys_calls}}
 
@@ -475,6 +600,7 @@ def run(a: argparse.Namespace) -> None:
                               str(rep) + ".nsys-rep"], check=True, capture_output=True, text=True)
       kernels[f"{side}:{name}:{phase}"] = per_call(parse_kern_sum(stats.stdout), a.nsys_calls)
 
+  env["gpu_end"] = gpu_state()
   report = {"env": env, "torch_env": torch_acc["env"], "backends": torch_acc["backends"],
             "deterministic": {r["name"]: r["deterministic"]
                               for r in torch_acc["candidates"] + candle_acc},
@@ -513,8 +639,21 @@ def render(rep: dict, names: list[str]) -> str:
            f"torch {te['torch']} (CUDA {te['cuda']}, cuDNN {te['cudnn']}, fp32 matmul precision "
            f"`{te['fp32_matmul_precision']}`); crate `{e['crate_commit']}`. Shape b·h·s·d = "
            f"{' · '.join(map(str, e['shape']))}, causal {e['causal']}, seed {e['seed']}. "
-           f"Timing: {e['timing']}.", "",
-           "## SDPA backends forced on these inputs (fwd + bwd)", ""]
+           f"Timing: {e['timing']}.", ""]
+  m = e.get("machine")
+  if m:
+    lines += ["## Machine", "",
+              f"- GPU: {te['gpu']}, driver {e['driver']} ({m['driver_model']}); power limit, "
+              f"max SM / memory clocks: {m['gpu_limits']}",
+              f"- PTX built by: nvcc {m['nvcc_on_path']} (the one on PATH; env: "
+              f"{m['cuda_env'] or 'none'})",
+              f"- crate {m['crate']}; candle-core {m['candle_core']}",
+              f"- host: {m['os']}; CPU {m['cpu']}",
+              f"- GPU state at the start: {e['gpu_start']}; at the end: {e['gpu_end']}",
+              "- GPU state before each timed process:"]
+    lines += [f"  - round {s['round'] + 1}, {s['side']}: {s['gpu']}" for s in rep["gpu_states"]]
+    lines += [""]
+  lines += ["## SDPA backends forced on these inputs (fwd + bwd)", ""]
   lines += [f"- `{k}`: {v}" for k, v in rep["backends"].items()]
   lines += ["", "## Accuracy against fp64 (normwise relative error; max-abs in brackets)", "",
             "| candidate | o | dq | dk | dv | 2 runs bitwise equal |", "|---|---|---|---|---|---|"]
