@@ -48,7 +48,8 @@ computes dK, dV and a dQ partial in one pass, the dQ partials added in key-block
   tiling, and is best designed after v0.3.0's. The tile constants are already named and derived,
   so the kernels can be templated on them.
 - **Upstream to candle.** The plan since the start (crate first, upstream second): candle has no
-  fused attention that trains, and none in fp32 on CUDA. kaio-candle 0.2.0 is the prior art to cite.
+  fused attention that trains, and none in fp32 on CUDA. [kaio-candle](https://github.com/dmriding/kaio/tree/main/kaio-candle) 0.2.0 is the
+  prior art to cite.
   A first, smaller report stands apart from our kernels: built with CUDA 13.1 for compute
   capability 7.5, candle-kernels' `compatibility.cuh` redefines `__hmax_nan` / `__hmin_nan`, which
   CUDA 13.1's `cuda_fp16.hpp` now provides, so candle itself does not compile there (devlog FA7).

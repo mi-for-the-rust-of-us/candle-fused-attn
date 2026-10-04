@@ -54,7 +54,8 @@
 //! candle's custom ops have no channel for intermediates kept from the forward for the backward,
 //! but candle hands `bwd` the SAME op instance the forward ran (`Op::CustomOp*` holds its `Arc`).
 //! The op therefore keeps the per-row log-sum-exp `L` (`[b, h, s]`, 1/64 of `O`) in a field, and
-//! its output is `O` alone. (kaio-candle, the prior art, instead re-runs the forward in `bwd`.)
+//! its output is `O` alone. ([kaio-candle](https://github.com/dmriding/kaio/tree/main/kaio-candle), the prior art,
+//! instead re-runs the forward in `bwd`.)
 //!
 //! # Limits (v0.3)
 //!
