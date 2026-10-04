@@ -23,7 +23,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA10](#fa10--design-l2-fewer-shared-loads-per-ffma) | 2026-10-04 | how to cut shared loads per FFMA on a 100 KB/SM card? | design; explicit fragment double-buffering **rejected** before building |
 | [FA11](#fa11--l2-forward-128-threads-8--4-outputs-per-thread) | 2026-10-04 | half the warps, twice the work per thread: faster or slower? | **slower** (+15.5 %): P1–P3 met, P4 missed — **rejected, reverted** |
 | [FA12](#fa12--v030-on-three-cards-rtx-5060-ti-rtx-4090-rtx-5090) | 2026-10-04 | does v0.3.0 hold on other cards, and in the whole training step? | P1, P3, P4 **met**; P2 half (5090 no-grad −19.7 %); P5 **missed** low (+1.8 % step) — release |
-| [FA13](#fa13--does-l2-residency-explain-the-5090s-smaller-no-grad-forward-gain) | 2026-10-04 | is the 5090's smaller no-grad forward gain L2 residency? | registered |
+| [FA13](#fa13--does-l2-residency-explain-the-5090s-smaller-no-grad-forward-gain) | 2026-10-04 | is the 5090's smaller no-grad forward gain L2 residency? | P1 **missed** (counters equal — under a profiler that erases the effect); P2, P3 **met**; the capacity pattern supports it |
 
 ---
 
@@ -713,3 +713,36 @@ long-scoreboard stall. (b) `bench/ab.py` v0.2 against v0.3 (FA9's kernels) at b 
 **Reading (fixed now).** P1 and P2 together support the hypothesis; with P3 the 5090's smaller
 no-grad gain is explained by the card's cache, not by a defect of v0.3. P1 failing refutes it, and
 the 5090's number stays unexplained.
+
+### FA13 — RESULT (2026-10-04, ~10:50): the timing pattern follows L2 capacity; the counters cannot see it
+
+Raw data: `target/fa13/` (ncu CSVs) and `target/ab/fa13-b16/` (git-ignored); ~3 min of GPU.
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1 (b 16): v0.2's L2 hit rate, `fwd` phase ≥ `train` + 20 pts | | **60.23 % against 60.22 %**; long scoreboard 2.18 against 2.19 (DRAM bytes: metric `n/a` on this card) | **missed** |
+| P2 (b 64 control): within 10 pts | | 59.96 % against 60.16 % | met |
+| P3 (b 16): no-grad gain ≥ 10 pts smaller than in training calls | | **−24.4 % against −43.1 %** (v0.2's forward 280.8 µs no-grad, 386.2 µs in training calls) | met |
+
+**Why P1 is a weak verdict.** Under Nsight Compute the timing difference itself vanishes: v0.2's
+forward reads 368.5 µs (`fwd` phase) against 353.0 µs (`train`), where nsys, on the same inputs,
+measures 280.8 against 386.2 µs. The profiler intercepts every launch and leaves gaps between
+kernels, so it measures a GPU that no longer behaves as the real run does; its equal hit rates
+(which look dominated by the kernel's own reuse — each K/V tile is read by 4 query blocks) cannot
+settle the question.
+
+**What supports the hypothesis: the gap follows L2 capacity across four conditions.**
+
+| card, batch | `qkv` | L2 | fits | v0.3's forward gain: no-grad / in training calls |
+|---|--:|--:|---|---|
+| RTX 5060 Ti, b 16 | 17.7 MB | 32 MB | yes | −24.4 % / −43.1 % (gap) |
+| RTX 5090, b 64 | 70.8 MB | ~96 MB | yes | −19.7 % / −38.5 % (gap) |
+| RTX 4090, b 64 | 70.8 MB | 72 MB | barely | −36.4 % / −37.3 % (no gap) |
+| RTX 5060 Ti, b 64 | 70.8 MB | 32 MB | no | −40.0 % / −43.6 % (no gap) |
+
+**Reading.** By the registered rule P1 failed, but its instrument removed the effect it was meant
+to see; the capacity pattern, from timings alone, supports L2 residency: when the inputs of
+back-to-back no-grad calls stay in L2, v0.2's exposed loads become cheap and v0.3 has less to
+hide. **Not a defect of v0.3**, whose no-grad forward is still the faster one everywhere. A
+decisive test without a profiler (proposed, not run): flush L2 between no-grad calls (a write
+larger than L2 between calls) and check that v0.2's forward slows to its in-training time.
