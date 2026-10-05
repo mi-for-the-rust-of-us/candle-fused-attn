@@ -25,6 +25,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA12](#fa12--v030-on-three-cards-rtx-5060-ti-rtx-4090-rtx-5090) | 2026-10-04 | does v0.3.0 hold on other cards, and in the whole training step? | P1, P3, P4 **met**; P2 half (5090 no-grad −19.7 %); P5 **missed** low (+1.8 % step) — release |
 | [FA13](#fa13--does-l2-residency-explain-the-5090s-smaller-no-grad-forward-gain) | 2026-10-04 | is the 5090's smaller no-grad forward gain L2 residency? | P1 **missed** (counters equal — under a profiler that erases the effect); P2, P3 **met**; the capacity pattern supports it |
 | [FA14](#fa14--the-backward-split-by-product-half-the-threads-on-each-of-the-two-products) | 2026-10-05 | does splitting each paired product across thread halves cut the backward's shared loads, bit for bit? | **all met**: backward −6.9 % (low end), shared loads −20.9 %, bitwise identical — **kept** |
+| [FA15](#fa15--the-backward-skips-its-dead-tail-work) | 2026-10-05 | does skipping the all-padding key groups, query rows and keys of the tail tiles speed the backward, bit for bit? | registered |
 
 ---
 
@@ -842,3 +843,62 @@ only a third of that: the extra barrier doubled the barrier stall (the two halve
 other twice per tile), and short scoreboard fell less than the loads did. The low end, not the
 middle. **Decision (the registered rule): kept** (≥ 5 %). Next: FA15, skipping the dead tail work
 with warp-uniform branches, registered on the same gate.
+
+---
+
+## FA15 — the backward skips its dead tail work
+
+*Registered 2026-10-05, before any code. Why: at the canvas length S = 240 the backward's tiles
+overhang the sequence twice — the last key block holds 48 live keys of 64, the last query tile 16
+live rows of 32 — and the kernel computes the overhang in full, on zero-filled rows. Counted below:
+**12.1 % of its multiply-adds produce nothing.** Any length that is not a multiple of 64 pays
+the same way; the crate pays it, not canvas alone.*
+
+**Change** (`fattn_bwd_f32_d64` only; every bound depends on S, the key block and the query tile
+alone, so the branches are uniform across the block or across whole warps at S = 240):
+- **Phase 1.** A key group jj (keys k0 + 16 jj … + 16) entirely ≥ S is skipped; a thread whose
+  four query rows are all ≥ S skips its dot products. The P / dS writes stay as they are (their
+  `live` mask already writes 0).
+- **Phase 2.** The query loop runs over the tile's live rows only (`min(32, S − q0)`); a thread whose
+  four keys are all ≥ S skips the phase (its dK / dV are never stored).
+- **Phase 3.** The key loop runs to `min(64, S − k0)` rounded up to 4; a thread whose two query
+  rows are both ≥ S skips its dot products. The dQ turn wait, the barriers and the stores are
+  untouched.
+- Forward, loads (dead rows stay zero-filled), tiles, shared memory: unchanged.
+
+**Why the bits cannot move.** A skipped term is a product with a zero factor: a zero-filled K, V, Q
+or dO row, or a P or dS that the `live` mask set to zero. Adding such a ±0 to an accumulator leaves it
+unchanged unless the accumulator is −0, and none ever is: every chain starts at +0, and an `fmaf`
+returns −0 only when its addend is already −0. A skipped dot product leaves its accumulator at +0,
+which is exactly what the zero rows produced (`+0 + −0 = +0` under round-to-nearest). **The
+bitwise gate applies**, causal and the odd lengths (7, 97) included.
+
+**Counted at the canvas shape** (b 64, h 6, S 240, non-causal; per (b, h): 4 key blocks × 8 query
+tiles = 32 block-tiles; each phase has the same overhang structure):
+
+| | key block 3, tiles 0–6 | key blocks 0–2, tile 7 | key block 3, tile 7 | saved |
+|---|--:|--:|--:|--:|
+| per phase, in block-tiles of work | 7 × 0.25 | 3 × 0.5 | 0.625 | **3.875 / 32 = 12.1 %** |
+
+FA14's profile measures 8.288 G fp32 instructions on the FMA pipes per launch (`fmaheavy` +
+`fmalite`), against 8.053 G multiply-adds counted by hand: the metric follows the work.
+
+**Predictions.**
+- **P1 (gate):** O, dQ, dK, dV bitwise identical to FA14's (`55aea18`) on `bench/bitwise.py`'s 6
+  shapes, both entry points, native and forced-fallback builds.
+- **P2:** fp32 instructions on the FMA pipes **−10 to −12.5 %** (8.288 G → 7.25–7.46 G); shared
+  loads down by a similar share; registers and shared memory unchanged.
+- **P3:** backward kernel time **−3 to −8 %** against FA14, alternated (`bench/ab.py`, `train`, 6
+  rounds) — sub-linear in the work saved: a warp that skips gives back issue slots, not its whole
+  share of the tile, since the block still waits for its slowest warp at each barrier.
+- **P4:** the forward unchanged (its PTX byte-identical).
+
+**Decision rule (fixed now).** P1 is a gate. Faster by ≥ 2 % with separated rounds: kept (a small
+change, under the bitwise gate). Otherwise reverted with a `MEASURED-REVERT` note. The forward's
+own overhang (its last query block holds 48 live rows of 64, its last key tile 48 live keys; the
+online softmax makes its bitwise argument more delicate) is FA16's question, not this one's.
+Confirmation on the 4090, 5090 and a first A100 at the next rental round (the RTX 3090 joins at the
+next release).
+
+**Where / cost.** Local RTX 5060 Ti: 4 bitwise dumps (~15 s each), `ab.py` 6 rounds (~2 min), `ncu`
+(seconds); builds ~10 s each.
