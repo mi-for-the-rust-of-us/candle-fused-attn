@@ -189,6 +189,10 @@ __device__ __forceinline__ void pass_turn(int* p, int next) {
 //            partial dS K; on its turn the block adds it into dQ: key block 0 stores, the others
 //            read (through L2) and add, the last contributor scales. The tile's dQ is thus
 //            ((p0 + p1) + p2) + ... in key-block order, whatever the scheduling.
+//   Measured and rejected (devlog FA15): skipping the tail tiles' dead work (key groups, query
+//   rows and keys past S) with runtime loop bounds -- bit-identical, 11.8 % fewer FMA-pipe
+//   instructions, but +14.2 % kernel time on an RTX 5060 Ti: every tile, full ones included, lost
+//   its fixed-trip unrolled loops (issue slots 40.8 -> 34.9 %, short scoreboard 1.19 -> 1.46).
 // No deadlock: a block waits only on LOWER key blocks of its own (b, h), which have lower linear
 // block indices and so were dispatched first (the assumption CUTLASS's serial split-K makes).
 // REFERENCE: flash_bwd_kernel.h (FlashAttention-2, Dao-AILab upstream) -- key blocks in parallel,

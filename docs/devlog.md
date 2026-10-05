@@ -25,7 +25,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA12](#fa12--v030-on-three-cards-rtx-5060-ti-rtx-4090-rtx-5090) | 2026-10-04 | does v0.3.0 hold on other cards, and in the whole training step? | P1, P3, P4 **met**; P2 half (5090 no-grad −19.7 %); P5 **missed** low (+1.8 % step) — release |
 | [FA13](#fa13--does-l2-residency-explain-the-5090s-smaller-no-grad-forward-gain) | 2026-10-04 | is the 5090's smaller no-grad forward gain L2 residency? | P1 **missed** (counters equal — under a profiler that erases the effect); P2, P3 **met**; the capacity pattern supports it |
 | [FA14](#fa14--the-backward-split-by-product-half-the-threads-on-each-of-the-two-products) | 2026-10-05 | does splitting each paired product across thread halves cut the backward's shared loads, bit for bit? | **all met**: backward −6.9 % (low end), shared loads −20.9 %, bitwise identical — **kept** |
-| [FA15](#fa15--the-backward-skips-its-dead-tail-work) | 2026-10-05 | does skipping the all-padding key groups, query rows and keys of the tail tiles speed the backward, bit for bit? | registered |
+| [FA15](#fa15--the-backward-skips-its-dead-tail-work) | 2026-10-05 | does skipping the all-padding key groups, query rows and keys of the tail tiles speed the backward, bit for bit? | P1, P2, P4 **met**; P3 **missed** (+14.2 %, slower) — **rejected, reverted** |
 
 ---
 
@@ -902,3 +902,41 @@ next release).
 
 **Where / cost.** Local RTX 5060 Ti: 4 bitwise dumps (~15 s each), `ab.py` 6 rounds (~2 min), `ncu`
 (seconds); builds ~10 s each.
+
+### FA15 — RESULT (2026-10-05, ~10:45): bitwise identical, 11.8 % less math, and 14.2 % slower — rejected
+
+Code as measured: `95cdd77`; reverted by `c430372` (the backward's PTX byte-identical to FA14's
+again, checked). Report:
+[`2026-10-05-rtx5060ti-ab-fa14-vs-fa15-rejected.md`](../bench/results/2026-10-05-rtx5060ti-ab-fa14-vs-fa15-rejected.md);
+profile `profiles/2026-10-05-rtx5060ti-bwd-candle-fused-attn-fa15-rejected.ncu-repz`. GPU used:
+~3 min.
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1: bitwise identity | vs FA14; 6 shapes; native and fallback | **identical** (and to v0.3.0) | met |
+| P2: FMA-pipe fp32 instructions | −10 to −12.5 % | **8.288 G → 7.313 G (−11.8 %)**; shared loads −10.5 %; registers 128 | met |
+| P3: backward kernel vs FA14, 6 rounds | −3 to −8 % | **+14.2 %** (2.194 → 2.505 ms), separated: FA15's fastest round above FA14's slowest | **missed** (slower) |
+| P4: forward PTX | byte-identical | byte-identical | met |
+
+| backward, under Nsight Compute | FA14 | FA15 |
+|---|--:|--:|
+| cycles elapsed (compare cycles, not durations: FA14's note) | 6.11 M | **6.84 M (+11.9 %)** |
+| instructions | 345.7 M | 340.3 M (−1.6 %) |
+| issue slots busy | 40.8 % | **34.9 %** |
+| short scoreboard; barrier; branch resolving | 1.19; 0.67; 0.07 | **1.46; 1.02; 0.24** |
+
+**Reading.** The work went exactly as counted, but the instruction count barely moved: the loop
+control of runtime-bounded loops (`i < nq`, `j < nk`) and the per-group branch replaced nearly all
+the saved arithmetic, and on EVERY tile — the 7 full tiles of 8 now run loops the compiler can no
+longer unroll to their fixed trip counts and schedule loads early in, which is what short
+scoreboard and the idle issue slots show. The skipping warps then wait at the next barrier for the
+others (barrier stall up). The dead work was 12 % of the multiply-adds of the TAIL tiles only; the
+cost landed on all of them. **Decision (the registered rule): reverted**, recorded in the kernel's
+header as FA11 was.
+
+**What would be needed instead (not registered).** Full tiles must keep today's code exactly: a
+separate tail path taken only when the tile overhangs S (`nq < 32` or `k0 + 64 > S`), its loops at
+fixed trip counts that are themselves compile-time (a template on the overhang class), so the
+compiler can unroll both. At S = 240 that path would run on 11 of 32 block-tiles; the gain is
+bounded by the 12.1 % of the multiply-adds it skips, minus the code-size and register cost of a
+second copy of each phase — a few percent at best, against a doubled kernel body.
