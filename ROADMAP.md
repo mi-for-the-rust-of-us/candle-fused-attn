@@ -59,6 +59,12 @@ computes dK, dV and a dQ partial in one pass, the dQ partials added in key-block
 - **The training step's other costs.** The canvas step gains +1.8 % for −13 % on the attention
   call: the step is partly host-bound — candle and candle-mi territory, not this crate's.
 
+- **At the next release: re-measure the training step.** The README's training-step line (and
+  `RESULTS.md`'s table) still reads 0.90× from 0.3.0 on an RTX 5090: 0.4.0's effect on the canvas
+  step (~0.3–0.5 %, estimated from FA14's −2.4 % on the attention call) is below what one trainer
+  A/B resolves, so it was not measured. The next release's rental re-runs the canvas trainer
+  against its PyTorch reference (askesis `torch_vs_candle.sh`, as FA12 did) and updates both.
+
 ## Later (speculative)
 
 - **head_dim 32 and 128.** The CUDA path takes 64 only; the CPU path takes any. 128 is the
