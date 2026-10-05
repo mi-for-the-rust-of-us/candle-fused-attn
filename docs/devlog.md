@@ -24,6 +24,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA11](#fa11--l2-forward-128-threads-8--4-outputs-per-thread) | 2026-10-04 | half the warps, twice the work per thread: faster or slower? | **slower** (+15.5 %): P1–P3 met, P4 missed — **rejected, reverted** |
 | [FA12](#fa12--v030-on-three-cards-rtx-5060-ti-rtx-4090-rtx-5090) | 2026-10-04 | does v0.3.0 hold on other cards, and in the whole training step? | P1, P3, P4 **met**; P2 half (5090 no-grad −19.7 %); P5 **missed** low (+1.8 % step) — release |
 | [FA13](#fa13--does-l2-residency-explain-the-5090s-smaller-no-grad-forward-gain) | 2026-10-04 | is the 5090's smaller no-grad forward gain L2 residency? | P1 **missed** (counters equal — under a profiler that erases the effect); P2, P3 **met**; the capacity pattern supports it |
+| [FA14](#fa14--the-backward-split-by-product-half-the-threads-on-each-of-the-two-products) | 2026-10-05 | does splitting each paired product across thread halves cut the backward's shared loads, bit for bit? | registered |
 
 ---
 
@@ -746,3 +747,68 @@ back-to-back no-grad calls stay in L2, v0.2's exposed loads become cheap and v0.
 hide. **Not a defect of v0.3**, whose no-grad forward is still the faster one everywhere. A
 decisive test without a profiler (proposed, not run): flush L2 between no-grad calls (a write
 larger than L2 between calls) and check that v0.2's forward slows to its in-training time.
+
+---
+
+## FA14 — the backward, split by product: half the threads on each of the two products
+
+*Registered 2026-10-05, before any code. Why now: in the canvas training step the backward is the
+larger attention cost (local 5060 Ti, b64, the Me10 binary: `fattn_bwd_f32_d64` 14.7 of 116.9
+kernel ms per step, the forward 5.4), and its top stall since FA9 is short scoreboard (1.28 warp
+cycles per issued instruction): waiting on shared-memory loads. The crate is improved on its own —
+nothing in candle patched — so that dropping it in is enough.*
+
+**The idea.** FA10 showed that more outputs per thread need larger tiles (no room in 99 KB) or fewer
+threads (FA11: 4 warps per SM, 15.5 % slower). There is a third way in the backward, because its
+phases 1 and 2 each compute TWO products over the same outputs: S = QKᵀ and dP = dO Vᵀ; dV = Pᵀ dO
+and dK = dSᵀ Q. Today each thread computes both products for few outputs, so each step loads four
+operands. Giving each product to one half of the block doubles every thread's outputs for the
+SAME tiles, shared memory, 256 threads and 8 warps per SM.
+
+**Change** (`fattn_bwd_f32_d64` only; `half = tid / 128`, warp-uniform):
+- **Phase 1.** Thread `u = tid % 128` owns query rows 4·(u / 16) … + 4 and keys (u % 16) + 16 jj
+  (jj 0–3): half 0 computes S from Q, K; half 1 computes dP from dO, V — 4 × 4 accumulators each,
+  per head-dimension step 4 + 4 `LDS.128` for 64 FFMA (today 12 for 64). Half 0 writes
+  P = exp(S·scale − L) (0 where not live, as today) to `Ps`; barrier; half 1 reads its 16 P back
+  and writes dS = P·(dP − D) to `dSs`; barrier. One barrier and 16 scalar loads more per tile.
+- **Phase 2.** Half 0 owns dV, half 1 owns dK: thread u owns keys 4·(u / 8) … + 4 and dims
+  4·(u % 8) … + 4 and 32 + 4·(u % 8) … + 4 (two float4 32 floats apart, so each 8-thread phase of a
+  128-bit load reads 32 consecutive words: no bank conflict). Per query: 1 + 2 `LDS.128` for 32
+  FFMA (today 4 for 32). 32 accumulators per thread, as today (16 dK + 16 dV).
+- **Phase 3** (the dQ partial), the dQ turn order, the loads (FA9's double buffers) and the
+  forward: unchanged.
+
+**Why the bits cannot move.** Every output keeps its accumulation and its order: S and dP are each
+one `dot4` chain over the head dimension in order; P, dS are the same expressions on the same
+floats (P is stored and re-read, exact); dV and dK are each one `fmaf` chain over query tiles, then
+queries, in order; only *which thread* computes an element changes. **The bitwise gate applies.**
+
+**Counted, per thread and query tile** (`LDS` instructions, FA10's method; phase 1 averaged over
+the halves: 128 and 128 + 16):
+
+| phase | today | FA14 |
+|---|--:|--:|
+| 1: S, dP | 192 | 136 |
+| 2: dV, dK | 128 | 96 |
+| 3: dQ partial | 96 | 96 |
+| total | 416 | **328 (−21 %)** |
+
+**Predictions.**
+- **P1 (gate):** O, dQ, dK, dV bitwise identical to v0.3.0 on `bench/bitwise.py`'s 6 shapes, both
+  entry points, native and forced-fallback (`CANDLE_FUSED_ATTN_SYNC_LOADS=1`) builds.
+- **P2:** backward shared-load instructions −19 to −23 % (Nsight Compute, FA8's protocol; today's
+  count from FA9's profile); registers 128–180 (≤ 255 keeps the one block per SM that shared memory
+  already sets); shared memory unchanged (87,552 B).
+- **P3:** short-scoreboard stall below FA9's 1.28; barrier stall up from 0.38 (one barrier more).
+- **P4:** backward kernel time **−6 to −14 %** against v0.3.0, alternated (`bench/ab.py`, `train`
+  phase, 6 rounds); the forward unchanged within ±2 %.
+
+**Decision rule (fixed now).** P1 is a gate. ≥ 5 % on the backward kernel: kept. Below 3 %:
+reverted with a `MEASURED-REVERT` note. 3–5 %: `ab.py` rerun with 10 rounds; kept if the gain
+holds ≥ 3 % with no round overlap. If kept, FA15 = skipping the dead tail work (S = 240: the last
+key block has 48 live keys of 64, the last query tile 16 live rows of 32, ~12 % of the FFMAs
+compute zeros) with warp-uniform branches, under the same gate. Card-side confirmation (4090, 5090,
+and a first A100) at the next rental, never a rental of its own.
+
+**Where / cost.** Local RTX 5060 Ti: bitwise dumps ~15 s each (4), `ab.py` ~1 min, `ncu` a few
+seconds; builds ~2 min CPU each.
