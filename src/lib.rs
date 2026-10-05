@@ -65,9 +65,9 @@
 //! use ordinary loads instead of `cp.async`. CUDA 13 toolkits no longer compile for Volta: build
 //! with CUDA 12 there.
 //!
-//! The kernels are plain fp32 FMAs. On GeForce cards that is faster than PyTorch's fp32 SDPA,
+//! The kernels are plain fp32 FMAs. On `GeForce` cards that is faster than `PyTorch`'s fp32 SDPA,
 //! whose 3xTF32 tensor-core path runs there at about the plain fp32 rate. On an A100, whose TF32
-//! tensor cores run at 8x its fp32 rate, PyTorch's SDPA is the faster fp32 attention today
+//! tensor cores run at 8x its fp32 rate, `PyTorch`'s SDPA is the faster fp32 attention today
 //! (measured: 1.7x on a training call).
 
 #![deny(warnings)]
