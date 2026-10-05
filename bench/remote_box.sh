@@ -40,7 +40,10 @@ case "$cmd" in
     ;;
   run)
     envs="BASE=${BASE:-v0.3.0} ROUNDS=${ROUNDS:-6}"
-    "${SSH[@]}" "cd $remote_dir && mkdir -p target/box/$label &&
+    # cd first, on its own line: a trailing `&` backgrounds a whole `a && b && c` list, which left
+    # the pid and the tail in the wrong directory on the first 5090 run.
+    "${SSH[@]}" "cd $remote_dir || exit 1
+      mkdir -p target/box/$label
       setsid nohup env $envs bash bench/box.sh $label > target/box/$label.out 2>&1 < /dev/null &
       echo \$! > target/box/$label.pid; sleep 5; echo started; tail -3 target/box/$label.out"
     ;;
@@ -50,9 +53,13 @@ case "$cmd" in
       elif kill -0 \$(cat target/box/$label.pid) 2> /dev/null; then echo RUNNING; else echo STOPPED-EARLY; fi"
     ;;
   pull)
-    mkdir -p target/box-home
-    "${SCP[@]}" -r "root@$host:$remote_dir/target/box/$label" target/box-home/
-    "${SCP[@]}" "root@$host:$remote_dir/target/box/$label.out" "target/box-home/$label/"
+    # Everything but the bulk: the two bitwise dumps (~0.5 GB each; bitwise.txt holds the verdict)
+    # and the shared inputs / output tensors (~0.5 GB) stay on the box. The 5090's full copy was
+    # 1.8 GB and took ~10 min home.
+    mkdir -p "target/box-home/$label"
+    "${SSH[@]}" "cd $remote_dir/target/box && tar czf - --exclude='$label/bitwise-base' \
+      --exclude='$label/bitwise-head' --exclude='*.safetensors' $label $label.out" \
+      | tar xzf - -C target/box-home
     echo "home: target/box-home/$label ($(ls target/box-home/$label | wc -l) entries)"
     ;;
   *) echo "unknown command $cmd" >&2; exit 1 ;;
