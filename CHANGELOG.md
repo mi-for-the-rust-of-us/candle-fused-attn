@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-05
+
 **Measured on five cards** (RTX 5060 Ti, 3090, 4090, 5090 and a first A100), 0.3.0 against 0.4.0
 alternated in one session, outputs bit-identical: backward kernel −5.6 to −6.9 % on the consumer
 cards, −0.5 % on the A100. Against PyTorch's fp32 SDPA, this crate stays faster on the consumer
