@@ -1069,7 +1069,8 @@ $0.20–0.50; **round total ≈ $0.5–0.8**.
 Three boxes, one at a time (`rentals.md` in askesis acsp14), `bench/remote_box.sh` at `468c712`
 (5090) and `a39eb66` (4090, A100; the two commits between are script fixes only). Results home,
 slim (bitwise dumps and safetensors left on the boxes): `target/box-home/{rtx5090,rtx4090,a100}/`.
-Cost: 5090 $0.20 (incl. a first launch lost to absent `safetensors`), 4090 $0.06, A100 (pending).
+Cost: 5090 $0.20 (incl. a first launch lost to absent `safetensors`), 4090 $0.06, A100 $0.11:
+**$0.37 for the round** (credit $9.76 → $9.39).
 
 | | RTX 5090 | RTX 4090 | A100-SXM4-40GB |
 |---|--:|--:|--:|
