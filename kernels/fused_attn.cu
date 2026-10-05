@@ -269,14 +269,6 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     const float* Lt = LDb + buf * 2 * KB_QRYS;  // L of this tile, 0 past S
     const float* Dt = Lt + KB_QRYS;             // D of this tile, 0 past S
 
-    // Dead tail work skipped (devlog FA15): every bound below depends on S, k0 and q0 alone.
-    // A skipped term has a zero factor (a zero-filled row, or a P / dS the `live` mask zeroed),
-    // and no accumulator is ever -0 (each chain starts at +0; fmaf returns -0 only from a -0
-    // addend), so skipping it leaves every bit unchanged.
-    const int ngrp = min(4, (S - k0 + 15) / 16);           // key groups jj holding a key < S
-    const int nq = min(KB_QRYS, S - q0);                   // live query rows of this tile
-    const int nk = min(KB_KEYS, (S - k0 + 3) / 4 * 4);     // phase-3 keys, in steps of 4
-
     // Phase 1. Half 0: s = Q K^T; half 1: s = dO V^T (dP). Same dot4 chain per element as when
     // one thread computed both (devlog FA14: the bitwise gate applies).
     const float* As = half ? dOs : Qs;
@@ -286,19 +278,16 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     for (int r = 0; r < 4; ++r)
 #pragma unroll
       for (int jj = 0; jj < 4; ++jj) s[r][jj] = 0.0f;
-    if (r0 < nq) {  // else all four rows are past S: s stays +0, as the zero rows gave
 #pragma unroll 4
-      for (int c = 0; c < HD; c += 4) {
-        float4 av[4];
+    for (int c = 0; c < HD; c += 4) {
+      float4 av[4];
 #pragma unroll
-        for (int r = 0; r < 4; ++r) av[r] = ld4(As + (r0 + r) * LD + c);
+      for (int r = 0; r < 4; ++r) av[r] = ld4(As + (r0 + r) * LD + c);
 #pragma unroll
-        for (int jj = 0; jj < 4; ++jj) {
-          if (jj >= ngrp) continue;  // the whole group is past S
-          const float4 bv = ld4(Bs + (kx + 16 * jj) * LD + c);
+      for (int jj = 0; jj < 4; ++jj) {
+        const float4 bv = ld4(Bs + (kx + 16 * jj) * LD + c);
 #pragma unroll
-          for (int r = 0; r < 4; ++r) s[r][jj] = dot4(av[r], bv, s[r][jj]);
-        }
+        for (int r = 0; r < 4; ++r) s[r][jj] = dot4(av[r], bv, s[r][jj]);
       }
     }
     if (half == 0) {
@@ -334,18 +323,16 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     // then queries in index order; no reduction across threads or blocks.
     const float* Xs = half ? dSs : Ps;
     const float* Ys = half ? Qs : dOs;
-    if (k0 + j0 < S) {  // else all four keys are past S: never stored
 #pragma unroll 4
-      for (int i = 0; i < nq; ++i) {
-        const float4 x4 = ld4(Xs + i * LD + j0);
-        const float4 ya = ld4(Ys + i * LD + e0), yb = ld4(Ys + i * LD + 32 + e0);
-        const float xs[4] = {x4.x, x4.y, x4.z, x4.w};
-        const float ys[8] = {ya.x, ya.y, ya.z, ya.w, yb.x, yb.y, yb.z, yb.w};
+    for (int i = 0; i < KB_QRYS; ++i) {
+      const float4 x4 = ld4(Xs + i * LD + j0);
+      const float4 ya = ld4(Ys + i * LD + e0), yb = ld4(Ys + i * LD + 32 + e0);
+      const float xs[4] = {x4.x, x4.y, x4.z, x4.w};
+      const float ys[8] = {ya.x, ya.y, ya.z, ya.w, yb.x, yb.y, yb.z, yb.w};
 #pragma unroll
-        for (int a = 0; a < 4; ++a)
+      for (int a = 0; a < 4; ++a)
 #pragma unroll
-          for (int e = 0; e < 8; ++e) acc[a][e] = fmaf(xs[a], ys[e], acc[a][e]);
-      }
+        for (int e = 0; e < 8; ++e) acc[a][e] = fmaf(xs[a], ys[e], acc[a][e]);
     }
 
     // dQ partial: pq[r][e] = sum_j dS[i0 + r][j] K[j][d0 + e], four keys at a time
@@ -354,21 +341,19 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     for (int r = 0; r < 2; ++r)
 #pragma unroll
       for (int e = 0; e < 4; ++e) pq[r][e] = 0.0f;
-    if (i0 < nq) {  // else both rows are past S: never stored
 #pragma unroll 2
-      for (int j = 0; j < nk; j += 4) {
-        const float4 s0 = ld4(dSs + i0 * LD + j), s1 = ld4(dSs + (i0 + 1) * LD + j);
-        const float sa[2][4] = {{s0.x, s0.y, s0.z, s0.w}, {s1.x, s1.y, s1.z, s1.w}};
+    for (int j = 0; j < KB_KEYS; j += 4) {
+      const float4 s0 = ld4(dSs + i0 * LD + j), s1 = ld4(dSs + (i0 + 1) * LD + j);
+      const float sa[2][4] = {{s0.x, s0.y, s0.z, s0.w}, {s1.x, s1.y, s1.z, s1.w}};
 #pragma unroll
-        for (int t = 0; t < 4; ++t) {
-          const float4 k4 = ld4(Ks + (j + t) * LD + d0);
+      for (int t = 0; t < 4; ++t) {
+        const float4 k4 = ld4(Ks + (j + t) * LD + d0);
 #pragma unroll
-          for (int r = 0; r < 2; ++r) {
-            pq[r][0] = fmaf(sa[r][t], k4.x, pq[r][0]);
-            pq[r][1] = fmaf(sa[r][t], k4.y, pq[r][1]);
-            pq[r][2] = fmaf(sa[r][t], k4.z, pq[r][2]);
-            pq[r][3] = fmaf(sa[r][t], k4.w, pq[r][3]);
-          }
+        for (int r = 0; r < 2; ++r) {
+          pq[r][0] = fmaf(sa[r][t], k4.x, pq[r][0]);
+          pq[r][1] = fmaf(sa[r][t], k4.y, pq[r][1]);
+          pq[r][2] = fmaf(sa[r][t], k4.z, pq[r][2]);
+          pq[r][3] = fmaf(sa[r][t], k4.w, pq[r][3]);
         }
       }
     }
