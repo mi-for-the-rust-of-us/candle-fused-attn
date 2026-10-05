@@ -27,7 +27,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA14](#fa14--the-backward-split-by-product-half-the-threads-on-each-of-the-two-products) | 2026-10-05 | does splitting each paired product across thread halves cut the backward's shared loads, bit for bit? | **all met**: backward −6.9 % (low end), shared loads −20.9 %, bitwise identical — **kept** |
 | [FA15](#fa15--the-backward-skips-its-dead-tail-work) | 2026-10-05 | does skipping the all-padding key groups, query rows and keys of the tail tiles speed the backward, bit for bit? | P1, P2, P4 **met**; P3 **missed** (+14.2 %, slower) — **rejected, reverted** |
 | [FA16](#fa16--the-dv-half-stops-waiting-for-ds) | 2026-10-05 | does letting the dV half start as soon as P is written (a 128-thread barrier for the dK half) give back FA14's barrier cost, bit for bit? | P1, P4 **met**; P2, P3 **missed** (+1.4 %, barrier stall up) — **rejected, reverted** |
-| [FA17](#fa17--fa14-on-three-rented-cards-rtx-5090-rtx-4090-and-a-first-a100) | 2026-10-05 | does FA14 hold off the 5060 Ti, and where does the crate stand on a datacenter card? | registered |
+| [FA17](#fa17--fa14-on-three-rented-cards-rtx-5090-rtx-4090-and-a-first-a100) | 2026-10-05 | does FA14 hold off the 5060 Ti, and where does the crate stand on a datacenter card? | P1–P4 **met** (backward −5.7 / −5.6 / −0.5 %; SDPA 1.73× faster than ours on the A100); P5 not measurable on vast |
 
 ---
 
@@ -1063,3 +1063,37 @@ path for sm_80/sm_90 becomes a roadmap candidate. P4 fails: we say that instead.
 Running, `send` ~3 min (rustup + a 21 MB bundle), builds ~3 min, GPU ~6 min, `pull` ~1 min: about
 20 min billed. 5090 (~$0.48/h) ≈ $0.16, 4090 (~$0.37/h) ≈ $0.13, A100 ($0.5–1.5/h, market) ≈
 $0.20–0.50; **round total ≈ $0.5–0.8**.
+
+### FA17 — RESULT (2026-10-05, 09:10–09:57 UTC): FA14 holds on both GeForce cards; on the A100, SDPA is 1.73× faster than us
+
+Three boxes, one at a time (`rentals.md` in askesis acsp14), `bench/remote_box.sh` at `468c712`
+(5090) and `a39eb66` (4090, A100; the two commits between are script fixes only). Results home,
+slim (bitwise dumps and safetensors left on the boxes): `target/box-home/{rtx5090,rtx4090,a100}/`.
+Cost: 5090 $0.20 (incl. a first launch lost to absent `safetensors`), 4090 $0.06, A100 (pending).
+
+| | RTX 5090 | RTX 4090 | A100-SXM4-40GB |
+|---|--:|--:|--:|
+| machine | driver 580.105, CUDA 13.0, 500 W | driver 595.71, CUDA 13.2, **350 W cap** | driver 595.91, CUDA 13.2, 400 W, MIG off |
+| P1: v0.3.0 vs FA14 bitwise; CUDA tests | identical; pass | identical; pass | identical; pass |
+| P2: backward kernel in training calls | 511.3 → 482.0 µs, **−5.7 %** | 691.0 → 652.3 µs, **−5.6 %** | 1939.1 → 1929.5 µs, **−0.5 %** |
+| rounds (6 each) | no overlap | no overlap | no overlap |
+| P3: forward kernel | +0.0 % | +0.0 % | +0.0 % |
+| ours vs SDPA, kernel time per training call (net of the head) | **0.813 vs 1.022 ms** | **1.183 vs 1.555 ms** | 2.856 vs **1.650 ms** |
+| ours vs SDPA, forward kernel | 0.178 vs 0.206 | 0.255 vs 0.333 | 0.625 vs **0.438** |
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1 | bitwise identical on each card | identical on all three | met |
+| P2 | −3 to −7 % on 5090 and 4090; 0 to −6 % on A100 | −5.7, −5.6; −0.5 | met (A100 at the low edge) |
+| P3 | forward ±3 % | +0.0 % everywhere | met |
+| P4 | on the A100 SDPA's forward + backward ≥ 1.5× faster; ours faster on the GeForce cards | 1.73× (SDPA backward 0.98 ms vs ours 1.93); ours 0.80× and 0.76× SDPA on 5090 and 4090 | met |
+| P5 | forward 2 blocks per SM on the A100 | not measurable: no profiler counters on vast | — |
+
+**Reading.** FA14 cuts shared loads; it pays where shared memory is the limit, on the consumer cards
+(128 fp32 lanes per SM), and not on the A100 (64 lanes per SM, arithmetic-bound), as P2's split
+predicted. On the A100, SDPA's fp32 kernels run 3xTF32 on tensor cores whose TF32 rate is 8× the
+fp32 rate: no FFMA kernel can match that there. **Decision (the registered rule):** FA14 goes into
+0.4.0 with these per-card numbers; the README says plainly that on A100-class cards PyTorch's SDPA
+is the faster fp32 attention today; an opt-in 3xTF32 path for sm_80/sm_90 becomes a ROADMAP
+candidate (it would change summation and so leave the bitwise-to-0.3 guarantee; its own gate
+would be accuracy against fp64, as SDPA's is). The RTX 3090 (sm_86) joins at the next release.
