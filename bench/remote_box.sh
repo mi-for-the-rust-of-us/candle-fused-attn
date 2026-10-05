@@ -27,6 +27,9 @@ case "$cmd" in
     echo "bundle: $(du -h "$bundle" | cut -f1), HEAD $(git rev-parse --short HEAD)"
     "${SCP[@]}" "$bundle" "root@$host:/root/candle-fused-attn.bundle"
     "${SSH[@]}" "set -e
+      # vast's PyTorch image ships torch in /venv/main but not always safetensors (FA12, FA17).
+      /venv/main/bin/python -c 'import safetensors' 2> /dev/null \
+        || /venv/main/bin/python -m pip install -q safetensors
       if [ ! -x \$HOME/.cargo/bin/cargo ]; then
         curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal
       fi
@@ -39,12 +42,12 @@ case "$cmd" in
     envs="BASE=${BASE:-v0.3.0} ROUNDS=${ROUNDS:-6}"
     "${SSH[@]}" "cd $remote_dir && mkdir -p target/box/$label &&
       setsid nohup env $envs bash bench/box.sh $label > target/box/$label.out 2>&1 < /dev/null &
-      sleep 2; echo started; tail -3 target/box/$label.out"
+      echo \$! > target/box/$label.pid; sleep 5; echo started; tail -3 target/box/$label.out"
     ;;
   status)
     "${SSH[@]}" "cd $remote_dir && tail -15 target/box/$label.out;
       if grep -q 'done: target/box' target/box/$label.out; then echo FINISHED;
-      elif pgrep -f 'bench/box.sh $label' > /dev/null; then echo RUNNING; else echo STOPPED-EARLY; fi"
+      elif kill -0 \$(cat target/box/$label.pid) 2> /dev/null; then echo RUNNING; else echo STOPPED-EARLY; fi"
     ;;
   pull)
     mkdir -p target/box-home
