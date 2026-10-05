@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# The crate's measurements on one machine, rented or local (devlog FA12): 0.2.0 against this
-# checkout, on that card, in one session.
+# The crate's measurements on one machine, rented or local (devlog FA12, FA17): a released
+# version against this checkout, on that card, in one session.
 #
-# Usage, from a clone of the repository (with its tags):  bash bench/box.sh <label>
+# Usage, from a clone of the repository (with its tags):
+#   [BASE=v0.3.0] [ROUNDS=6] bash bench/box.sh <label>
 #   1. records the machine (GPU, driver, nvcc, CPU, commit);
-#   2. builds the `compare` example of v0.2.0 (a git worktree of the tag) and of this checkout;
+#   2. builds the `compare` example of BASE (a git worktree of the tag) and of this checkout;
 #   3. the bitwise gate: both builds' outputs over bench/bitwise.py's shapes, bit for bit;
 #   4. the CUDA tests (parity, bitwise reruns);
 #   5. bench/compare.py: this checkout against PyTorch (its run also warms this build);
-#   6. bench/ab.py: v0.2.0 against this checkout, alternated, forward and training phases.
+#   6. bench/ab.py: BASE against this checkout, alternated (ROUNDS rounds), forward and training.
 # Everything lands in target/box/<label>/ (git-ignored), for the operator to bring home.
 # GPU time on an RTX 5060 Ti: ~5 min, after the two builds on the CPU.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-label="${1:?usage: bash bench/box.sh <label>}"
+label="${1:?usage: [BASE=v0.3.0] [ROUNDS=6] bash bench/box.sh <label>}"
+BASE="${BASE:-v0.3.0}"  # the baseline release (FA12 measured v0.2.0)
+ROUNDS="${ROUNDS:-6}"   # ab.py rounds: FA14-FA16's protocol
 out="target/box/$label"
 mkdir -p "$out"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$out/box.log"; }
@@ -40,7 +43,7 @@ if [ "${OS:-}" = "Windows_NT" ]; then SUF=".exe"; fi
 # --- 1. The machine -------------------------------------------------------------------------------
 {
   echo "label: $label"; echo "date: $(date -Iseconds)"
-  echo "commit: $(git describe --always --dirty --tags)"
+  echo "commit: $(git describe --always --dirty --tags)"; echo "base: $BASE"
   nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,power.limit,clocks.max.sm \
     --format=csv,noheader
   nvcc --version | tail -1
@@ -51,22 +54,23 @@ if [ "${OS:-}" = "Windows_NT" ]; then SUF=".exe"; fi
 log "machine: $(head -4 "$out/machine.txt" | tail -2 | tr '\n' ' ')"
 
 # --- 2. The two builds ----------------------------------------------------------------------------
-git rev-parse -q --verify v0.2.0 > /dev/null || git fetch --tags -q
-if [ ! -d target/v020-src ]; then git worktree add -q target/v020-src v0.2.0; fi
-log "build v0.2.0 (CPU)"
-(cd target/v020-src && cargo build -q --release --features cuda --example compare)
-cp -p "target/v020-src/target/release/examples/compare$SUF" "$out/compare-v020$SUF"
+git rev-parse -q --verify "$BASE" > /dev/null || git fetch --tags -q
+src="target/base-src-$BASE"
+if [ ! -d "$src" ]; then git worktree add -q "$src" "$BASE"; fi
+log "build $BASE (CPU)"
+(cd "$src" && cargo build -q --release --features cuda --example compare)
+cp -p "$src/target/release/examples/compare$SUF" "$out/compare-base$SUF"
 log "build this checkout (CPU)"
 cargo build -q --release --features cuda --example compare
 cp -p "target/release/examples/compare$SUF" "$out/compare-head$SUF"
-A="$out/compare-v020$SUF"
+A="$out/compare-base$SUF"
 B="$out/compare-head$SUF"
 
 # --- 3. The bitwise gate --------------------------------------------------------------------------
 log "bitwise gate (GPU)"
-"$PY" bench/bitwise.py dump "$A" "$out/bitwise-v020" > /dev/null
+"$PY" bench/bitwise.py dump "$A" "$out/bitwise-base" > /dev/null
 "$PY" bench/bitwise.py dump "$B" "$out/bitwise-head" > /dev/null
-"$PY" bench/bitwise.py diff "$out/bitwise-v020" "$out/bitwise-head" > "$out/bitwise.txt" \
+"$PY" bench/bitwise.py diff "$out/bitwise-base" "$out/bitwise-head" > "$out/bitwise.txt" \
   || { log "BITWISE GATE FAILED -- see $out/bitwise.txt"; exit 1; }
 log "$(tail -1 "$out/bitwise.txt")"
 
@@ -80,9 +84,9 @@ log "compare.py (GPU, ~2.5 min)"
 "$PY" bench/compare.py run --skip-build --nsys "$NSYS" --out "$out/compare" > "$out/compare.log" 2>&1
 log "compare.py done"
 
-# --- 6. v0.2.0 against this checkout, alternated --------------------------------------------------
-log "ab.py v0.2.0 vs this checkout (GPU, ~1 min)"
+# --- 6. BASE against this checkout, alternated ----------------------------------------------------
+log "ab.py $BASE vs this checkout, $ROUNDS rounds (GPU, ~20 s per round)"
 "$PY" bench/ab.py "$A" "$B" --inputs "$out/compare/inputs.safetensors" --nsys "$NSYS" \
-  --out "$out/ab" > "$out/ab.txt" 2>&1
+  --rounds "$ROUNDS" --out "$out/ab" > "$out/ab.txt" 2>&1
 tail -12 "$out/ab.txt" | tee -a "$out/box.log"
 log "done: $out"

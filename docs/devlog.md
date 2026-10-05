@@ -27,6 +27,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA14](#fa14--the-backward-split-by-product-half-the-threads-on-each-of-the-two-products) | 2026-10-05 | does splitting each paired product across thread halves cut the backward's shared loads, bit for bit? | **all met**: backward −6.9 % (low end), shared loads −20.9 %, bitwise identical — **kept** |
 | [FA15](#fa15--the-backward-skips-its-dead-tail-work) | 2026-10-05 | does skipping the all-padding key groups, query rows and keys of the tail tiles speed the backward, bit for bit? | P1, P2, P4 **met**; P3 **missed** (+14.2 %, slower) — **rejected, reverted** |
 | [FA16](#fa16--the-dv-half-stops-waiting-for-ds) | 2026-10-05 | does letting the dV half start as soon as P is written (a 128-thread barrier for the dK half) give back FA14's barrier cost, bit for bit? | P1, P4 **met**; P2, P3 **missed** (+1.4 %, barrier stall up) — **rejected, reverted** |
+| [FA17](#fa17--fa14-on-three-rented-cards-rtx-5090-rtx-4090-and-a-first-a100) | 2026-10-05 | does FA14 hold off the 5060 Ti, and where does the crate stand on a datacenter card? | registered |
 
 ---
 
@@ -1019,3 +1020,46 @@ reverted**, named in the kernel header.
 remaining small, bitwise levers inside today's structure did not pay. The next step is the
 registered one: the rental round (A100, 4090, 5090) confirming FA14 and measuring the crate on
 datacenter hardware, before any larger redesign is chosen.
+
+---
+
+## FA17 — FA14 on three rented cards: RTX 5090, RTX 4090, and a first A100
+
+*Registered 2026-10-05, before any rental. Why: FA14 is measured on the 5060 Ti only, and FA12
+showed that a gain measured there shrinks on bigger cards (FA9's backward −14.3 % locally became
+−8.9 % on the 5090 and −11.9 % on the 4090). And every card in `RESULTS.md` is GeForce: the A100
+(sm_80, 108 SMs, 164 KB of shared memory per SM, fp32 19.5 TFLOPS but TF32 tensor cores at 8× that)
+is what most people who would drop this crate in actually train on. The RTX 3090 joins at the next
+release, not this round.*
+
+**Protocol.** `bench/box.sh <label>` on each card, now against **v0.3.0** (`BASE`, default) with
+`ab.py` at **6 rounds** (`ROUNDS`): machine record, both builds on the box, the bitwise gate, the CUDA
+tests, `compare.py` (against PyTorch's SDPA on that card), `ab.py` alternated. The source travels as a
+git bundle (`bench/remote_box.sh … send`: every branch and tag, nothing published), so the box
+measures the local HEAD exactly. Results home with `remote_box.sh … pull`. Validated locally first
+(5060 Ti, 6 min 23 s, at `adc8f60` + the uncommitted script): bitwise identical, 3 test binaries ok,
+backward −7.5 % (FA14's report: −6.9 %). No Nsight Compute on vast (FA12: `ERR_NVGPUCTRPERM`): times
+only.
+
+**Predictions.**
+- **P1 (gate):** v0.3.0 and HEAD bitwise identical on each card (6 shapes, both entry points).
+- **P2:** backward kernel inside training calls, HEAD vs v0.3.0: **−3 to −7 %** on the 5090 and on
+  the 4090 (about 60–80 % of the local −6.9 %, FA9's pattern); **0 to −6 %** on the A100, whose
+  SM has half the fp32 lanes of a consumer Ampere/Ada/Blackwell SM (64 against 128), so it is more
+  arithmetic-bound and saves less from fewer shared loads.
+- **P3:** the forward kernel unchanged within ±3 % on each card (its PTX is byte-identical).
+- **P4 (A100 against PyTorch):** SDPA's fp32 path (`fmha_cutlass*_f32`, 3xTF32 on tensor cores)
+  is **faster than ours on the A100**: forward + backward kernel time ours ≥ 1.5× SDPA's. On the
+  5090 and the 4090 ours stays faster than SDPA's, as in FA12.
+- **P5 (A100 occupancy, read from the build, not profiled):** the forward (69,632 B) fits two blocks
+  per SM in 164 KB; the backward (87,552 B) still one.
+
+**Decision rule (fixed now).** P1 fails anywhere: stop, no release, investigate. P2 holds on at least
+two of three cards: FA14 goes into 0.4.0 with per-card numbers. P4 holds: the README says it plainly
+(on an A100-class card, PyTorch's SDPA is the faster fp32 attention today), and an opt-in 3xTF32
+path for sm_80/sm_90 becomes a roadmap candidate. P4 fails: we say that instead.
+
+**Where / cost.** Three vast.ai boxes, `PyTorch (Vast)` template, SSH. Per box: ~5 min to reach
+Running, `send` ~3 min (rustup + a 21 MB bundle), builds ~3 min, GPU ~6 min, `pull` ~1 min: about
+20 min billed. 5090 (~$0.48/h) ≈ $0.16, 4090 (~$0.37/h) ≈ $0.13, A100 ($0.5–1.5/h, market) ≈
+$0.20–0.50; **round total ≈ $0.5–0.8**.
