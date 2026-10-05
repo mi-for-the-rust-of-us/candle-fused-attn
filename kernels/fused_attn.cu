@@ -176,10 +176,15 @@ __device__ __forceinline__ void pass_turn(int* p, int next) {
 }
 
 // dK, dV, dQ. grid (ceil(S / 64), H, B). A block owns key block kb = blockIdx.x (64 keys) and walks
-// query tiles of 32.
-//   phase 1: S and dP for [32 queries x 64 keys]; thread (ty = tid / 16, tx = tid % 16) owns
-//            query rows 2ty, 2ty+1 and keys tx + 16 jj; P and dS go to shared memory.
-//   phase 2: thread owns keys 4 (tid / 16) .. +4 and dims 4 (tid % 16) .. +4 of dV and dK.
+// query tiles of 32. Phases 1 and 2 each compute two products over the same outputs; each product
+// goes to one half of the block (half = tid / 128, u = tid % 128; devlog FA14), so a thread does
+// twice the outputs of one product for half the operand loads per step.
+//   phase 1: S (half 0, from Q and K) or dP (half 1, from dO and V) for [32 queries x 64 keys];
+//            thread u owns query rows 4 (u / 16) .. +4 and keys u % 16 + 16 jj. Half 0 writes
+//            P to shared memory; after a barrier, half 1 reads it back and writes dS.
+//   phase 2: dV (half 0, from P and dO) or dK (half 1, from dS and Q); thread u owns keys
+//            4 (u / 8) .. +4 and dims 4 (u % 8) .. +4 and 32 + 4 (u % 8) .. +4 (two float4 32
+//            floats apart: each 8-thread phase of a 128-bit load reads 32 consecutive words).
 //   phase 3: thread owns queries 2 (tid / 16), +1 and dims 4 (tid % 16) .. +4 of the tile's dQ
 //            partial dS K; on its turn the block adds it into dQ: key block 0 stores, the others
 //            read (through L2) and add, the last contributor scales. The tile's dQ is thus
@@ -217,9 +222,10 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
   float* LDb = dSs + KB_QRYS * LD;              // [2][2][32]: L then D, current and next tile
 
   const int b = blockIdx.z, h = blockIdx.y, kb = blockIdx.x, k0 = kb * KB_KEYS;
-  const int tid = threadIdx.x, ty = tid / 16, tx = tid % 16;
-  const int j0 = 4 * (tid / 16), d0 = 4 * (tid % 16);  // phase-2 ownership
-  const int i0 = 2 * (tid / 16);                       // phase-3 ownership (and d0)
+  const int tid = threadIdx.x, half = tid / 128, u = tid % 128;  // half: warp-uniform
+  const int r0 = 4 * (u / 16), kx = u % 16;                       // phase-1 ownership
+  const int j0 = 4 * (u / 8), e0 = 4 * (u % 8);                   // phase-2 ownership
+  const int i0 = 2 * (tid / 16), d0 = 4 * (tid % 16);             // phase-3 ownership
   int* tp = turn + ((int64_t)b * H + h) * ((S + KB_QRYS - 1) / KB_QRYS);
   const float* qp = q + b * q_sb + h * q_sh;
   const float* gp = d_o + b * do_sb + h * do_sh;
@@ -229,11 +235,13 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
   load_tile4(Ks, k + b * k_sb + h * k_sh, k_ss, k0, KB_KEYS, S);
   load_tile4(Vs, v + b * v_sb + h * v_sh, v_ss, k0, KB_KEYS, S);
 
-  float adk[4][4], adv[4][4];
+  // Half 0: dV; half 1: dK (unscaled until the store). [a][e]: key j0 + a; dim e0 + e for e < 4,
+  // 32 + e0 + e - 4 for e >= 4.
+  float acc[4][8];
 #pragma unroll
   for (int a = 0; a < 4; ++a)
 #pragma unroll
-    for (int e = 0; e < 4; ++e) adk[a][e] = adv[a][e] = 0.0f;
+    for (int e = 0; e < 8; ++e) acc[a][e] = 0.0f;
 
   // Causal: queries before the block's first key never see it.
   const int q_begin = causal ? (k0 / KB_QRYS) * KB_QRYS : 0;
@@ -261,56 +269,70 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     const float* Lt = LDb + buf * 2 * KB_QRYS;  // L of this tile, 0 past S
     const float* Dt = Lt + KB_QRYS;             // D of this tile, 0 past S
 
-    float s[2][4], dpv[2][4];
+    // Phase 1. Half 0: s = Q K^T; half 1: s = dO V^T (dP). Same dot4 chain per element as when
+    // one thread computed both (devlog FA14: the bitwise gate applies).
+    const float* As = half ? dOs : Qs;
+    const float* Bs = half ? Vs : Ks;
+    float s[4][4];
 #pragma unroll
-    for (int r = 0; r < 2; ++r)
+    for (int r = 0; r < 4; ++r)
 #pragma unroll
-      for (int jj = 0; jj < 4; ++jj) s[r][jj] = dpv[r][jj] = 0.0f;
+      for (int jj = 0; jj < 4; ++jj) s[r][jj] = 0.0f;
 #pragma unroll 4
     for (int c = 0; c < HD; c += 4) {
-      const float4 q0v = ld4(Qs + (2 * ty) * LD + c), q1v = ld4(Qs + (2 * ty + 1) * LD + c);
-      const float4 g0v = ld4(dOs + (2 * ty) * LD + c), g1v = ld4(dOs + (2 * ty + 1) * LD + c);
+      float4 av[4];
+#pragma unroll
+      for (int r = 0; r < 4; ++r) av[r] = ld4(As + (r0 + r) * LD + c);
 #pragma unroll
       for (int jj = 0; jj < 4; ++jj) {
-        const float4 kv = ld4(Ks + (tx + 16 * jj) * LD + c);
-        const float4 vv = ld4(Vs + (tx + 16 * jj) * LD + c);
-        s[0][jj] = dot4(q0v, kv, s[0][jj]);
-        s[1][jj] = dot4(q1v, kv, s[1][jj]);
-        dpv[0][jj] = dot4(g0v, vv, dpv[0][jj]);
-        dpv[1][jj] = dot4(g1v, vv, dpv[1][jj]);
+        const float4 bv = ld4(Bs + (kx + 16 * jj) * LD + c);
+#pragma unroll
+        for (int r = 0; r < 4; ++r) s[r][jj] = dot4(av[r], bv, s[r][jj]);
       }
     }
+    if (half == 0) {
 #pragma unroll
-    for (int r = 0; r < 2; ++r) {
-      const int il = 2 * ty + r, i = q0 + il;
-      const float li = Lt[il], di = Dt[il];  // i >= S: 0, as v0.2's guarded reads gave
+      for (int r = 0; r < 4; ++r) {
+        const int il = r0 + r, i = q0 + il;
+        const float li = Lt[il];  // i >= S: 0, as v0.2's guarded reads gave
 #pragma unroll
-      for (int jj = 0; jj < 4; ++jj) {
-        const int jl = tx + 16 * jj, j = k0 + jl;
-        const bool live = i < S && j < S && !(causal && j > i);
-        const float p = live ? expf(s[r][jj] * scale - li) : 0.0f;
-        Ps[il * LD + jl] = p;
-        dSs[il * LD + jl] = p * (dpv[r][jj] - di);
+        for (int jj = 0; jj < 4; ++jj) {
+          const int jl = kx + 16 * jj, j = k0 + jl;
+          const bool live = i < S && j < S && !(causal && j > i);
+          Ps[il * LD + jl] = live ? expf(s[r][jj] * scale - li) : 0.0f;
+        }
+      }
+    }
+    __syncthreads();
+    if (half == 1) {
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const int il = r0 + r;
+        const float di = Dt[il];  // i >= S: 0
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+          const int jl = kx + 16 * jj;
+          dSs[il * LD + jl] = Ps[il * LD + jl] * (s[r][jj] - di);
+        }
       }
     }
     __syncthreads();
 
-    // dV[j] += sum_i P[i][j] dO[i];  dK[j] += sum_i dS[i][j] Q[i]
+    // Phase 2. Half 0: dV[j] += sum_i P[i][j] dO[i]; half 1: dK[j] += sum_i dS[i][j] Q[i].
     // DETERMINISM: each dK, dV element is one thread's register, summed over query tiles and
     // then queries in index order; no reduction across threads or blocks.
+    const float* Xs = half ? dSs : Ps;
+    const float* Ys = half ? Qs : dOs;
 #pragma unroll 4
     for (int i = 0; i < KB_QRYS; ++i) {
-      const float4 p4 = ld4(Ps + i * LD + j0), s4 = ld4(dSs + i * LD + j0);
-      const float4 g4 = ld4(dOs + i * LD + d0), q4 = ld4(Qs + i * LD + d0);
-      const float pa[4] = {p4.x, p4.y, p4.z, p4.w}, sa[4] = {s4.x, s4.y, s4.z, s4.w};
-      const float ga[4] = {g4.x, g4.y, g4.z, g4.w}, qa[4] = {q4.x, q4.y, q4.z, q4.w};
+      const float4 x4 = ld4(Xs + i * LD + j0);
+      const float4 ya = ld4(Ys + i * LD + e0), yb = ld4(Ys + i * LD + 32 + e0);
+      const float xs[4] = {x4.x, x4.y, x4.z, x4.w};
+      const float ys[8] = {ya.x, ya.y, ya.z, ya.w, yb.x, yb.y, yb.z, yb.w};
 #pragma unroll
       for (int a = 0; a < 4; ++a)
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-          adv[a][e] = fmaf(pa[a], ga[e], adv[a][e]);
-          adk[a][e] = fmaf(sa[a], qa[e], adk[a][e]);
-        }
+        for (int e = 0; e < 8; ++e) acc[a][e] = fmaf(xs[a], ys[e], acc[a][e]);
     }
 
     // dQ partial: pq[r][e] = sum_j dS[i0 + r][j] K[j][d0 + e], four keys at a time
@@ -376,15 +398,23 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
     }
   }
 
+  // Half 0 stores dV, half 1 stores dK x scale.
+  float* dst = dqkv + (half ? H * HD : 2 * H * HD);
 #pragma unroll
   for (int a = 0; a < 4; ++a) {
     const int j = k0 + j0 + a;
     if (j >= S) continue;
-    const int64_t off = ((int64_t)b * S + j) * (3 * H * HD) + h * HD + d0;
-    *reinterpret_cast<float4*>(dqkv + H * HD + off) =
-        make_float4(adk[a][0] * scale, adk[a][1] * scale, adk[a][2] * scale, adk[a][3] * scale);
-    *reinterpret_cast<float4*>(dqkv + 2 * H * HD + off) =
-        make_float4(adv[a][0], adv[a][1], adv[a][2], adv[a][3]);
+    const int64_t off = ((int64_t)b * S + j) * (3 * H * HD) + h * HD + e0;
+    if (half) {
+      *reinterpret_cast<float4*>(dst + off) =
+          make_float4(acc[a][0] * scale, acc[a][1] * scale, acc[a][2] * scale, acc[a][3] * scale);
+      *reinterpret_cast<float4*>(dst + off + 32) =
+          make_float4(acc[a][4] * scale, acc[a][5] * scale, acc[a][6] * scale, acc[a][7] * scale);
+    } else {
+      *reinterpret_cast<float4*>(dst + off) = make_float4(acc[a][0], acc[a][1], acc[a][2], acc[a][3]);
+      *reinterpret_cast<float4*>(dst + off + 32) =
+          make_float4(acc[a][4], acc[a][5], acc[a][6], acc[a][7]);
+    }
   }
 }
 

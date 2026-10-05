@@ -24,7 +24,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA11](#fa11--l2-forward-128-threads-8--4-outputs-per-thread) | 2026-10-04 | half the warps, twice the work per thread: faster or slower? | **slower** (+15.5 %): P1–P3 met, P4 missed — **rejected, reverted** |
 | [FA12](#fa12--v030-on-three-cards-rtx-5060-ti-rtx-4090-rtx-5090) | 2026-10-04 | does v0.3.0 hold on other cards, and in the whole training step? | P1, P3, P4 **met**; P2 half (5090 no-grad −19.7 %); P5 **missed** low (+1.8 % step) — release |
 | [FA13](#fa13--does-l2-residency-explain-the-5090s-smaller-no-grad-forward-gain) | 2026-10-04 | is the 5090's smaller no-grad forward gain L2 residency? | P1 **missed** (counters equal — under a profiler that erases the effect); P2, P3 **met**; the capacity pattern supports it |
-| [FA14](#fa14--the-backward-split-by-product-half-the-threads-on-each-of-the-two-products) | 2026-10-05 | does splitting each paired product across thread halves cut the backward's shared loads, bit for bit? | registered |
+| [FA14](#fa14--the-backward-split-by-product-half-the-threads-on-each-of-the-two-products) | 2026-10-05 | does splitting each paired product across thread halves cut the backward's shared loads, bit for bit? | **all met**: backward −6.9 % (low end), shared loads −20.9 %, bitwise identical — **kept** |
 
 ---
 
@@ -812,3 +812,33 @@ and a first A100) at the next rental, never a rental of its own.
 
 **Where / cost.** Local RTX 5060 Ti: bitwise dumps ~15 s each (4), `ab.py` ~1 min, `ncu` a few
 seconds; builds ~2 min CPU each.
+
+### FA14 — RESULT (2026-10-05, ~10:15): backward −6.9 %, bitwise identical; every prediction met, the time at the low end
+
+Code: committed with this result. Report:
+[`2026-10-05-rtx5060ti-ab-v0.3.0-vs-fa14.md`](../bench/results/2026-10-05-rtx5060ti-ab-v0.3.0-vs-fa14.md);
+profiles `profiles/2026-10-05-rtx5060ti-bwd-candle-fused-attn-{v030,fa14}.ncu-repz` (same session).
+Reference binaries `target/v030{,-sync}/compare.exe` (the crate at `d7ded1d`, kernels as released).
+GPU used: ~3 min.
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1: bitwise identity | O, dQ, dK, dV; 6 shapes; native and fallback | **identical** (6 shapes × 2 entry points; native, forced fallback) | met |
+| P2: shared loads; registers; shared memory | −19 to −23 %; 128–180; 87,552 B | **41.29 M → 32.64 M (−20.9 %)**; 128; 87,552 B | met |
+| P3: short scoreboard down; barrier up | below 1.28; above 0.38 | **1.277 → 1.186**; **0.385 → 0.672** | met |
+| P4: backward kernel, alternated vs v0.3.0, 6 rounds | −6 to −14 %; forward ±2 % | **−6.9 %** (2.369 → 2.205 ms), separated (2,253 µs worst vs 2,356 best); forward −1.2 % alone, +2.5 % inside the training call with overlapping rounds | met (low end) |
+
+Also: shared-memory bank conflicts on loads 1.72 M → 0.14 M and on stores 1.58 M → 0.01 M (the
+new phase-1 and phase-2 mappings happen to be conflict-free where today's P / dS stores and the
+phase-2 loads were not); MIO throttle 0.56 → 0.23; instructions −3.6 %. **A trap, recorded:** under
+Nsight Compute the two kernels ran at different clocks (2.61 GHz for v0.3.0, 2.28 GHz for FA14), so
+ncu's durations say FA14 is slower (2.46 → 2.68 ms) while its cycles say faster (elapsed 6.40 M →
+6.11 M, −4.5 %; active −6.6 %). FA3's rule holds: ncu says why, nsys says how fast — and compare
+cycles, never ncu durations, across two profiles. The forward kernel's PTX is byte-identical in both
+builds. Crate tests (`cargo test --release --features cuda`) pass.
+
+**Reading.** The loads went exactly as counted (−20.9 % for −21 % predicted), but the time gained
+only a third of that: the extra barrier doubled the barrier stall (the two halves wait for each
+other twice per tile), and short scoreboard fell less than the loads did. The low end, not the
+middle. **Decision (the registered rule): kept** (≥ 5 %). Next: FA15, skipping the dead tail work
+with warp-uniform branches, registered on the same gate.

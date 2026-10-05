@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The backward splits each paired product across the two halves of the block** (devlog FA14):
+  in phase 1 half the threads compute S, the other half dP; in phase 2 half accumulate dV, the
+  other half dK. Each thread now computes twice the outputs of one product for half the operand
+  loads: shared-load instructions −20.9 %, same tiles, shared memory and occupancy. Outputs are
+  **bitwise identical** to 0.3.0. RTX 5060 Ti, canvas shape, alternated with 0.3.0 in one session:
+  backward kernel 2.369 → 2.205 ms (−6.9 %).
+
 ## [0.3.0] - 2026-10-04
 
 **Measured on three cards** (RTX 5060 Ti, 4090, 5090), 0.2.0 against 0.3.0 alternated in one
