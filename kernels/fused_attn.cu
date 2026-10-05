@@ -193,6 +193,9 @@ __device__ __forceinline__ void pass_turn(int* p, int next) {
 //   rows and keys past S) with runtime loop bounds -- bit-identical, 11.8 % fewer FMA-pipe
 //   instructions, but +14.2 % kernel time on an RTX 5060 Ti: every tile, full ones included, lost
 //   its fixed-trip unrolled loops (issue slots 40.8 -> 34.9 %, short scoreboard 1.19 -> 1.46).
+//   Measured and rejected (devlog FA16): half 0 starting dV before dS is written (a 128-thread
+//   named barrier for half 1) -- bit-identical, +1.4 % (not separated): the tile still lasts as
+//   long as half 1's dS + dK, so half 0 only moves its wait to the barrier before phase 3.
 // No deadlock: a block waits only on LOWER key blocks of its own (b, h), which have lower linear
 // block indices and so were dispatched first (the assumption CUTLASS's serial split-K makes).
 // REFERENCE: flash_bwd_kernel.h (FlashAttention-2, Dao-AILab upstream) -- key blocks in parallel,

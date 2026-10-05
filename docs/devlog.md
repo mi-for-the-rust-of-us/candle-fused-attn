@@ -26,7 +26,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA13](#fa13--does-l2-residency-explain-the-5090s-smaller-no-grad-forward-gain) | 2026-10-04 | is the 5090's smaller no-grad forward gain L2 residency? | P1 **missed** (counters equal — under a profiler that erases the effect); P2, P3 **met**; the capacity pattern supports it |
 | [FA14](#fa14--the-backward-split-by-product-half-the-threads-on-each-of-the-two-products) | 2026-10-05 | does splitting each paired product across thread halves cut the backward's shared loads, bit for bit? | **all met**: backward −6.9 % (low end), shared loads −20.9 %, bitwise identical — **kept** |
 | [FA15](#fa15--the-backward-skips-its-dead-tail-work) | 2026-10-05 | does skipping the all-padding key groups, query rows and keys of the tail tiles speed the backward, bit for bit? | P1, P2, P4 **met**; P3 **missed** (+14.2 %, slower) — **rejected, reverted** |
-| [FA16](#fa16--the-dv-half-stops-waiting-for-ds) | 2026-10-05 | does letting the dV half start as soon as P is written (a 128-thread barrier for the dK half) give back FA14's barrier cost, bit for bit? | registered |
+| [FA16](#fa16--the-dv-half-stops-waiting-for-ds) | 2026-10-05 | does letting the dV half start as soon as P is written (a 128-thread barrier for the dK half) give back FA14's barrier cost, bit for bit? | P1, P4 **met**; P2, P3 **missed** (+1.4 %, barrier stall up) — **rejected, reverted** |
 
 ---
 
@@ -988,3 +988,34 @@ FA16 confirmed there, `gemm_autotune` alongside), before any larger redesign is 
 
 **Where / cost.** Local RTX 5060 Ti: 4 bitwise dumps (~15 s each), `ab.py` 6 rounds (~2 min), `ncu`
 (seconds); builds ~10 s each.
+
+### FA16 — RESULT (2026-10-05, ~11:10): bitwise identical, no faster — rejected
+
+Code as measured: `b0aa346`; reverted by `9a5a13d` (the backward's PTX byte-identical to FA14's
+again, checked). Report:
+[`2026-10-05-rtx5060ti-ab-fa14-vs-fa16-rejected.md`](../bench/results/2026-10-05-rtx5060ti-ab-fa14-vs-fa16-rejected.md);
+profile `profiles/2026-10-05-rtx5060ti-bwd-candle-fused-attn-fa16-rejected.ncu-repz`. GPU used:
+~3 min.
+
+| | predicted | measured | |
+|---|---|---|---|
+| P1: bitwise identity | vs FA14; 6 shapes; native and fallback | **identical** | met |
+| P2: barrier stall; instructions; registers | 0.45–0.62; ±1 %; 128 ± 16 | **0.672 → 0.725 (up)**; +0.2 %; 128 | **missed** |
+| P3: backward kernel vs FA14, 6 rounds | −1 to −4 % | **+1.4 %** (2.198 → 2.228 ms), rounds overlapping | **missed** |
+| P4: forward PTX | byte-identical | byte-identical | met |
+
+Under Nsight Compute: active cycles 5.902 M → 5.900 M (unchanged); short scoreboard 1.19 → 1.08,
+MIO throttle 0.23 → 0.28, issue slots 40.8 → 40.6 %.
+
+**Reading — the registration's model was wrong.** It treated the wait at the barrier after dS as
+removable idle time. It is not: each tile's critical path runs through half 1 (dS, then dK over 32
+queries) and then phase 3, which needs all of dS. Letting half 0 finish dV earlier shortens nobody's
+path; half 0 waits at the barrier before phase 3 instead (barrier stall slightly UP), and the tile
+takes as long as before. To gain, the two halves' work would have to be rebalanced (half 1 does dS
+on top of the same phase-2 load as half 0), not reordered. **Decision (the registered rule):
+reverted**, named in the kernel header.
+
+**Where the backward stands after FA14-FA16.** FA14 (kept): −6.9 %. FA15 and FA16 (rejected): the
+remaining small, bitwise levers inside today's structure did not pay. The next step is the
+registered one: the rental round (A100, 4090, 5090) confirming FA14 and measuring the crate on
+datacenter hardware, before any larger redesign is chosen.
