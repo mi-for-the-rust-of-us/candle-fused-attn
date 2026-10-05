@@ -57,13 +57,18 @@
 //! its output is `O` alone. ([kaio-candle](https://github.com/dmriding/kaio/tree/main/kaio-candle), the prior art,
 //! instead re-runs the forward in `bwd`.)
 //!
-//! # Limits (v0.3)
+//! # Limits (v0.4)
 //!
 //! f32 only; on CUDA `head_dim` must be 64 (the CPU path takes any). No dropout, no additive
 //! mask beyond `causal`. The backward's dQ turn counters use `ld.acquire` / `st.release` at GPU
 //! scope, so the CUDA path needs compute capability 7.0 (Volta) or newer; below 8.0 the kernels
 //! use ordinary loads instead of `cp.async`. CUDA 13 toolkits no longer compile for Volta: build
 //! with CUDA 12 there.
+//!
+//! The kernels are plain fp32 FMAs. On GeForce cards that is faster than PyTorch's fp32 SDPA,
+//! whose 3xTF32 tensor-core path runs there at about the plain fp32 rate. On an A100, whose TF32
+//! tensor cores run at 8x its fp32 rate, PyTorch's SDPA is the faster fp32 attention today
+//! (measured: 1.7x on a training call).
 
 #![deny(warnings)]
 // The MSRV lint guard: `deny(warnings)` implies `deny(unknown_lints)`, and the MSRV toolchain's

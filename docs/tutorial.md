@@ -187,8 +187,9 @@ Three rules make its numbers mean something: alternate the candidates in rounds 
 discard the first run of a freshly built binary (the driver compiles its kernels then); and compare
 with PyTorch only on the same machine, in the same session.
 
-`bench/box.sh <label>` runs the whole measurement of one card — 0.2.0 against your checkout, bit
-for bit and in time, and against PyTorch — as the README's numbers were measured.
+`bench/box.sh <label>` runs the whole measurement of one card — a released version (`BASE`,
+default 0.3.0) against your checkout, bit for bit and in time, and against PyTorch — as the
+README's numbers were measured. `bench/remote_box.sh` runs it on a rented machine from yours.
 
 ## 7. When not to use it
 
@@ -199,3 +200,5 @@ for bit and in time, and against PyTorch — as the README's numbers were measur
   requested.
 - Dropout on the attention weights, or an additive mask other than causal.
 - A GPU older than Volta (compute capability 7.0).
+- An A100-class card, if speed is the point: there PyTorch's fp32 SDPA (3xTF32 on tensor cores)
+  is about 1.7x faster than this crate's plain fp32 kernels (RESULTS.md).

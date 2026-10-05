@@ -59,35 +59,44 @@ backward, single-head).
 ## Measured
 
 Kernel time per call, in **milliseconds**, at the canvas trainer's shape (b 64 · h 6 · s 240 ·
-d 64, non-causal), 2026-10-04; lower is better, **bold** = fastest. PyTorch SDPA is its fp32
+d 64, non-causal), 2026-10-05; lower is better, **bold** = fastest. PyTorch SDPA is its fp32
 `scaled_dot_product_attention` (memory-efficient backend, 3xTF32 on tensor cores), measured in the
 same session. Every number and its report: [RESULTS.md](RESULTS.md).
 
 | ![RTX 5060 Ti](https://img.shields.io/badge/RTX_5060_Ti-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
 |---|--:|--:|
-| **candle-fused-attn** 0.3.0 | **0.895** | **3.982** |
-| PyTorch SDPA | 0.978 | 4.963 |
+| **candle-fused-attn** 0.4.0 | **0.781** | **3.733** |
+| PyTorch SDPA | 0.903 | 4.621 |
 
 | ![RTX 4090](https://img.shields.io/badge/RTX_4090-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
 |---|--:|--:|
-| **candle-fused-attn** 0.3.0 | **0.254** | **1.200** |
-| PyTorch SDPA | 0.334 | 1.559 |
+| **candle-fused-attn** 0.4.0 | **0.255** | **1.183** |
+| PyTorch SDPA | 0.333 | 1.555 |
 
 | ![RTX 5090](https://img.shields.io/badge/RTX_5090-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
 |---|--:|--:|
-| **candle-fused-attn** 0.3.0 | **0.192** | **0.891** |
-| PyTorch SDPA | 0.243 | 1.104 |
+| **candle-fused-attn** 0.4.0 | **0.178** | **0.813** |
+| PyTorch SDPA | 0.206 | 1.022 |
 
-**Accuracy** against fp64 (normwise relative error, dQ): candle-fused-attn 4.0e-7, SDPA 8.0e-7 —
-plain fp32 FMAs keep half SDPA's error.
+| ![A100](https://img.shields.io/badge/A100_SXM4-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
+|---|--:|--:|
+| candle-fused-attn 0.4.0 | 0.625 | 2.856 |
+| **PyTorch SDPA** | **0.438** | **1.650** |
 
-**0.2.0 → 0.3.0**, alternated in one session, outputs bit-identical: forward kernel −37 to −44 %
-inside training calls (−20 to −40 % in no-grad calls), backward −9 to −16 %, an attention
-training call −13 to −16 %, on the three cards. How, with
-every prediction and every rejected idea: [`docs/devlog.md`](docs/devlog.md).
+**On an A100, use PyTorch's SDPA if speed is the point**: its fp32 path runs 3xTF32 on tensor
+cores, which on that card run at 8× the plain fp32 rate. On consumer cards that rate is about the
+plain fp32 rate, and this crate's plain fp32 FMAs are faster.
+
+**Accuracy** against fp64 (normwise relative error, dQ): candle-fused-attn 4.0e-7 on every card,
+SDPA 8.0e-7 to 1.0e-6 — plain fp32 FMAs keep about half SDPA's error.
+
+**0.3.0 → 0.4.0**, alternated in one session, outputs bit-identical: backward kernel −5.6 to −6.9 %
+on the consumer cards, −0.5 % on the A100; the forward unchanged. **0.2.0 → 0.3.0**: forward kernel
+−37 to −44 % inside training calls, backward −9 to −16 %. How, with every prediction and every
+rejected idea: [`docs/devlog.md`](docs/devlog.md).
 
 **In a training step** (a 6-layer masked-diffusion model through candle-mi) against its PyTorch
-reference: 5.1× slower on 2026-07-29, **0.90×** on an RTX 5090 with this release.
+reference: 5.1× slower on 2026-07-29, **0.90×** on an RTX 5090 with 0.3.0.
 
 ## Tutorial
 
@@ -101,7 +110,8 @@ use it. Its code is [`examples/tutorial.rs`](examples/tutorial.rs), which CI run
 - No dropout, and no additive mask beyond `causal`.
 - The CUDA path needs compute capability **7.0 (Volta) or newer**; below 8.0 it uses ordinary
   loads instead of `cp.async`. CUDA 13 toolkits no longer compile for Volta: on a V100, build
-  with CUDA 12. Tested on an RTX 5060 Ti, an RTX 4090 and an RTX 5090.
+  with CUDA 12. Tested on an RTX 5060 Ti, an RTX 4090, an RTX 5090 and an A100.
+- Plain fp32 FMAs, no tensor cores: on an A100-class card PyTorch's fp32 SDPA is faster (above).
 
 ## Building and testing
 
@@ -109,7 +119,7 @@ use it. Its code is [`examples/tutorial.rs`](examples/tutorial.rs), which CI run
 cargo test                     # the CPU path: no GPU, no CUDA toolkit
 cargo test --features cuda     # the kernels: CUDA vs CPU within the measured band, bitwise reruns
 bash scripts/ci-local.sh       # before pushing: CI + the release's checks (--no-cuda: no GPU)
-bash bench/box.sh <label>      # one card's measurement: 0.2.0 vs this checkout, and PyTorch
+bash bench/box.sh <label>      # one card's measurement: 0.3.0 vs this checkout, and PyTorch
 ```
 
 The `cuda` feature compiles the kernels with `nvcc` at build time (the CUDA toolkit must be

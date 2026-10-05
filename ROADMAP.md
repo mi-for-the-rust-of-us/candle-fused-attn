@@ -14,6 +14,16 @@ comparable across seeds, cards and days. Everything below is ranked by what that
 
 ## Current state
 
+**v0.4.0** shipped 2026-10-05. *The backward splits each product pair across the block's two
+halves, outputs unchanged bit for bit.* Half the threads compute S, the other half dP; then half
+accumulate dV, half dK: −21 % shared loads at the same tiles, shared memory and occupancy.
+Measured against 0.3.0, alternated, on four cards: backward kernel −5.6 to −6.9 % on the consumer
+cards (RTX 5060 Ti, 4090, 5090), −0.5 % on an A100 (arithmetic-bound, not shared-memory-bound).
+**On the A100, PyTorch's fp32 SDPA is 1.7× faster than this crate** (its 3xTF32 tensor-core path
+runs there at 8× the fp32 rate); on the consumer cards this crate stays faster. Two further
+bitwise levers were measured and rejected (FA15: skipping the tail tiles' dead work, +14 %;
+FA16: letting the dV half skip the dS wait, +1.4 %). [`docs/devlog.md`](docs/devlog.md) FA14–FA17.
+
 **v0.3.0** shipped 2026-10-04. *Loads overlap the math, outputs unchanged bit for bit.* Both
 kernels copy their next tiles with asynchronous loads (`cp.async`) while the current tile
 computes — FlashAttention-2's load schedule in the forward, double-buffered query tiles in the
@@ -32,10 +42,19 @@ computes dK, dV and a dQ partial in one pass, the dQ partials added in key-block
 
 ## Next: candidates (not yet chosen)
 
-- **Larger tiles at 8 warps per SM.** Both kernels now wait mostly on shared-memory loads; the
-  128-thread remedy was measured slower (devlog FA11: fewer warps cost more than the loads saved).
-  The remaining route keeps 256 threads with larger tiles, which needs swizzled, unpadded shared
-  memory to fit 99 KB per block (FA10).
+- **The A100 (and datacenter cards), in two steps.** First, *why* it is slower: a profile with
+  counters (not available on vast.ai's containers), and the occupancy lever — with the
+  backward's dO single-buffered (as FlashAttention-2 does) it needs ~77 KB, so cards with 164 KB
+  per SM run two blocks, 16 warps, while 100 KB cards keep today's code; bitwise-safe. Only
+  query-side tiles may adapt to the card: key-side tiles set the summation order, which must stay
+  a function of the shape alone. Second, if the gap remains, an **opt-in 3xTF32 path** for
+  sm_80 / sm_90: deterministic, but not bitwise equal to the FFMA path, so gated on accuracy
+  against fp64, as SDPA is.
+- **Larger tiles at 8 warps per SM** (consumer cards). FA14 cut shared loads by splitting product
+  pairs at today's tiles; the remaining route keeps 256 threads with larger tiles, which needs
+  swizzled, unpadded shared memory to fit 99 KB per block (FA10). Tail-tile specialisation is
+  a few percent at best (FA15: runtime bounds on the hot loops cost +14 %).
+- **The RTX 3090** (sm_86, consumer Ampere) joins the measured cards at the next release.
 - **The L2 question, to settle.** FA13 found the 5090's smaller no-grad forward gain follows L2
   capacity; a profiler-free test (flush L2 between calls) would confirm it.
 - **The training step's other costs.** The canvas step gains +1.8 % for −13 % on the attention
@@ -45,7 +64,7 @@ computes dK, dV and a dQ partial in one pass, the dQ partials added in key-block
 
 - **head_dim 32 and 128.** The CUDA path takes 64 only; the CPU path takes any. 128 is the
   Llama / Qwen / Mistral head size and doubles the shared memory per tile, so it needs its own
-  tiling, and is best designed after v0.3.0's. The tile constants are already named and derived,
+  tiling, and is best designed after v0.4.0's. The tile constants are already named and derived,
   so the kernels can be templated on them.
 - **Upstream to candle.** The plan since the start (crate first, upstream second): candle has no
   fused attention that trains, and none in fp32 on CUDA. [kaio-candle](https://github.com/dmriding/kaio/tree/main/kaio-candle) 0.2.0 is the
