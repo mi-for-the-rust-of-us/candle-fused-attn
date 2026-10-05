@@ -308,6 +308,9 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
       }
     }
     __syncthreads();
+    // Half 0 needs only P and dO for dV, so it goes straight to phase 2; half 1 writes dS and
+    // syncs among its own 4 warps before dK reads it (devlog FA16). Named barrier 1, 128
+    // threads (__syncthreads is barrier 0); it orders shared memory among its participants.
     if (half == 1) {
 #pragma unroll
       for (int r = 0; r < 4; ++r) {
@@ -319,8 +322,8 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
           dSs[il * LD + jl] = Ps[il * LD + jl] * (s[r][jj] - di);
         }
       }
+      asm volatile("bar.sync 1, 128;" : : : "memory");
     }
-    __syncthreads();
 
     // Phase 2. Half 0: dV[j] += sum_i P[i][j] dO[i]; half 1: dK[j] += sum_i dS[i][j] Q[i].
     // DETERMINISM: each dK, dV element is one thread's register, summed over query tiles and
@@ -338,6 +341,7 @@ extern "C" __global__ void __launch_bounds__(NT) fattn_bwd_f32_d64(
 #pragma unroll
         for (int e = 0; e < 8; ++e) acc[a][e] = fmaf(xs[a], ys[e], acc[a][e]);
     }
+    __syncthreads();  // phase 3 reads all of dS
 
     // dQ partial: pq[r][e] = sum_j dS[i0 + r][j] K[j][d0 + e], four keys at a time
     float pq[2][4];
