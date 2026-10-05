@@ -78,6 +78,11 @@ same session. Every number and its report: [RESULTS.md](RESULTS.md).
 | **candle-fused-attn** 0.4.0 | **0.178** | **0.813** |
 | PyTorch SDPA | 0.206 | 1.022 |
 
+| ![RTX 3090](https://img.shields.io/badge/RTX_3090-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
+|---|--:|--:|
+| **candle-fused-attn** 0.4.0 | **0.580** | **2.337** |
+| PyTorch SDPA | 0.832 | 3.522 |
+
 | ![A100](https://img.shields.io/badge/A100_SXM4-76B900?logo=nvidia&logoColor=white) | forward | forward + backward |
 |---|--:|--:|
 | candle-fused-attn 0.4.0 | 0.625 | 2.856 |
@@ -110,7 +115,7 @@ use it. Its code is [`examples/tutorial.rs`](examples/tutorial.rs), which CI run
 - No dropout, and no additive mask beyond `causal`.
 - The CUDA path needs compute capability **7.0 (Volta) or newer**; below 8.0 it uses ordinary
   loads instead of `cp.async`. CUDA 13 toolkits no longer compile for Volta: on a V100, build
-  with CUDA 12. Tested on an RTX 5060 Ti, an RTX 4090, an RTX 5090 and an A100.
+  with CUDA 12. Tested on an RTX 5060 Ti, 3090, 4090 and 5090, and an A100.
 - Plain fp32 FMAs, no tensor cores: on an A100-class card PyTorch's fp32 SDPA is faster (above).
 
 ## Building and testing

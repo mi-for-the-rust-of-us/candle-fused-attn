@@ -17,8 +17,8 @@ comparable across seeds, cards and days. Everything below is ranked by what that
 **v0.4.0** shipped 2026-10-05. *The backward splits each product pair across the block's two
 halves, outputs unchanged bit for bit.* Half the threads compute S, the other half dP; then half
 accumulate dV, half dK: −21 % shared loads at the same tiles, shared memory and occupancy.
-Measured against 0.3.0, alternated, on four cards: backward kernel −5.6 to −6.9 % on the consumer
-cards (RTX 5060 Ti, 4090, 5090), −0.5 % on an A100 (arithmetic-bound, not shared-memory-bound).
+Measured against 0.3.0, alternated, on five cards: backward kernel −5.6 to −6.9 % on the consumer
+cards (RTX 5060 Ti, 3090, 4090, 5090), −0.5 % on an A100 (arithmetic-bound, not shared-memory-bound).
 **On the A100, PyTorch's fp32 SDPA is 1.7× faster than this crate** (its 3xTF32 tensor-core path
 runs there at 8× the fp32 rate); on the consumer cards this crate stays faster. Two further
 bitwise levers were measured and rejected (FA15: skipping the tail tiles' dead work, +14 %;
@@ -54,7 +54,6 @@ computes dK, dV and a dQ partial in one pass, the dQ partials added in key-block
   pairs at today's tiles; the remaining route keeps 256 threads with larger tiles, which needs
   swizzled, unpadded shared memory to fit 99 KB per block (FA10). Tail-tile specialisation is
   a few percent at best (FA15: runtime bounds on the hot loops cost +14 %).
-- **The RTX 3090** (sm_86, consumer Ampere) joins the measured cards at the next release.
 - **The L2 question, to settle.** FA13 found the 5090's smaller no-grad forward gain follows L2
   capacity; a profiler-free test (flush L2 between calls) would confirm it.
 - **The training step's other costs.** The canvas step gains +1.8 % for −13 % on the attention

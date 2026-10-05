@@ -63,6 +63,16 @@ training call −2.3 % ([A/B](bench/results/2026-10-05-rtx4090-ab-v0.3.0-vs-v0.4
 0.2.0 → 0.3.0, alternated: forward kernel −36.4 %; backward −11.9 %; training call −13.0 %
 ([A/B](bench/results/2026-10-04-rtx4090-ab-v0.2.0-vs-v0.3.md)).
 
+### RTX 3090
+
+| date | crate | forward | fwd + bwd | SDPA forward | SDPA fwd + bwd | report |
+|---|---|--:|--:|--:|--:|---|
+| 2026-10-05 | **0.4.0** (`313005b`) | **0.580** | **2.337** | 0.832 | 3.522 | [compare](bench/results/2026-10-05-rtx3090-compare-v0.4.md) |
+
+0.3.0 → 0.4.0, alternated: backward kernel −5.7 %, forward +0.0 %, training call −2.7 %
+([A/B](bench/results/2026-10-05-rtx3090-ab-v0.3.0-vs-v0.4.md)). Consumer Ampere (sm_86): TF32 tensor
+throughput about the plain fp32 rate, so SDPA's 3xTF32 path is at its weakest here (1.5× our time).
+
 ### A100-SXM4-40GB
 
 | date | crate | forward | fwd + bwd | SDPA forward | SDPA fwd + bwd | report |
@@ -79,8 +89,8 @@ consumer card: arithmetic-bound, not shared-memory-bound), forward +0.0 %, train
 ### Accuracy
 
 Against an fp64 reference (normwise relative error): this crate's figures are identical on all
-four cards and unchanged since 0.2.0 (0.3.0's and 0.4.0's outputs are bit-identical to 0.2.0's).
-SDPA's vary by card: below, the RTX 5090 and 5060 Ti; on the RTX 4090 and the A100, 7.6e-7 / 1.0e-6
+five cards and unchanged since 0.2.0 (0.3.0's and 0.4.0's outputs are bit-identical to 0.2.0's).
+SDPA's vary by card: below, the RTX 5090 and 5060 Ti; on the RTX 4090, 3090 and the A100, 7.6e-7 / 1.0e-6
 / 1.0e-6 / 8.0e-7.
 
 | | O | dQ | dK | dV |

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-**Measured on four cards** (RTX 5060 Ti, 4090, 5090 and a first A100), 0.3.0 against 0.4.0
+**Measured on five cards** (RTX 5060 Ti, 3090, 4090, 5090 and a first A100), 0.3.0 against 0.4.0
 alternated in one session, outputs bit-identical: backward kernel −5.6 to −6.9 % on the consumer
 cards, −0.5 % on the A100. Against PyTorch's fp32 SDPA, this crate stays faster on the consumer
 cards; **on the A100, SDPA is 1.7× faster** (3xTF32 on tensor cores), and the README says so.
@@ -20,7 +20,7 @@ Every number and its report: `RESULTS.md`.
   other half dK. Each thread now computes twice the outputs of one product for half the operand
   loads: shared-load instructions −20.9 %, same tiles, shared memory and occupancy. Outputs are
   **bitwise identical** to 0.3.0. Backward kernel against 0.3.0, alternated: RTX 5060 Ti −6.9 %,
-  RTX 5090 −5.7 %, RTX 4090 −5.6 %, A100 −0.5 % (devlog FA17).
+  RTX 5090 −5.7 %, RTX 3090 −5.7 %, RTX 4090 −5.6 %, A100 −0.5 % (devlog FA17).
 - `bench/box.sh` measures a released version (`BASE`, default `v0.3.0`) against the checkout,
   with `ab.py` at `ROUNDS` rounds (default 6).
 
@@ -29,7 +29,7 @@ Every number and its report: `RESULTS.md`.
 - `bench/remote_box.sh`: runs `box.sh` on a rented machine from yours — the repository travels as
   a git bundle (nothing published), the run is detached, the results come home without the bulky
   bitwise dumps.
-- The A100 in `RESULTS.md` and the README, and a Limits line in the crate docs and the tutorial:
+- The RTX 3090 and the A100 in `RESULTS.md` and the README, and a Limits line in the crate docs and the tutorial:
   on A100-class cards PyTorch's fp32 SDPA is the faster attention today.
 
 ## [0.3.0] - 2026-10-04

@@ -1098,3 +1098,11 @@ fp32 rate: no FFMA kernel can match that there. **Decision (the registered rule)
 is the faster fp32 attention today; an opt-in 3xTF32 path for sm_80/sm_90 becomes a ROADMAP
 candidate (it would change summation and so leave the bitwise-to-0.3 guarantee; its own gate
 would be accuracy against fp64, as SDPA's is). The RTX 3090 (sm_86) joins at the next release.
+
+**FA17 addendum (2026-10-05, 10:25–10:33 UTC): the RTX 3090 measured before the 0.4.0 tag**
+(Éric's call, moving it forward from the next release). vast.ai instance 54298861, RTX 3090
+(sm_86, 350 W stock, driver 595.99, CUDA 13.2), `313005b`: v0.3.0 vs FA14 **bitwise identical**,
+CUDA tests pass; backward kernel 1529.6 → 1443.1 µs (**−5.7 %**, no round overlap), forward
++0.0 %, training call −2.7 %; against SDPA, kernel time per training call **2.337 vs 3.522 ms**
+(SDPA 1.5× our time: on consumer Ampere TF32 tensor throughput ≈ plain fp32, SDPA's weakest
+card). Within P2's consumer-card range. Reports: `bench/results/2026-10-05-rtx3090-*-v0.4.md`.
