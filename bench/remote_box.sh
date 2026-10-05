@@ -14,7 +14,9 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 host="${1:?host}"; port="${2:?port}"; label="${3:?label}"; cmd="${4:?send|run|status|pull}"
 key="$HOME/.ssh/id_ed25519"
-SSH=(ssh -p "$port" -i "$key" -o StrictHostKeyChecking=accept-new "root@$host")
+OPTS=(-i "$key" -o StrictHostKeyChecking=accept-new)
+SSH=(ssh -p "$port" "${OPTS[@]}" "root@$host")
+SCP=(scp -P "$port" "${OPTS[@]}")
 remote_dir="/root/candle-fused-attn"
 
 case "$cmd" in
@@ -23,7 +25,7 @@ case "$cmd" in
     mkdir -p target/remote
     git bundle create "$bundle" --all
     echo "bundle: $(du -h "$bundle" | cut -f1), HEAD $(git rev-parse --short HEAD)"
-    scp -P "$port" -i "$key" "$bundle" "root@$host:/root/candle-fused-attn.bundle"
+    "${SCP[@]}" "$bundle" "root@$host:/root/candle-fused-attn.bundle"
     "${SSH[@]}" "set -e
       if [ ! -x \$HOME/.cargo/bin/cargo ]; then
         curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal
@@ -46,8 +48,8 @@ case "$cmd" in
     ;;
   pull)
     mkdir -p target/box-home
-    scp -r -P "$port" -i "$key" "root@$host:$remote_dir/target/box/$label" target/box-home/
-    scp -P "$port" -i "$key" "root@$host:$remote_dir/target/box/$label.out" "target/box-home/$label/"
+    "${SCP[@]}" -r "root@$host:$remote_dir/target/box/$label" target/box-home/
+    "${SCP[@]}" "root@$host:$remote_dir/target/box/$label.out" "target/box-home/$label/"
     echo "home: target/box-home/$label ($(ls target/box-home/$label | wc -l) entries)"
     ;;
   *) echo "unknown command $cmd" >&2; exit 1 ;;
