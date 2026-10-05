@@ -26,6 +26,7 @@ per-release roadmaps ([`roadmap-v0.3.0.md`](roadmap-v0.3.0.md)); shipped history
 | [FA13](#fa13--does-l2-residency-explain-the-5090s-smaller-no-grad-forward-gain) | 2026-10-04 | is the 5090's smaller no-grad forward gain L2 residency? | P1 **missed** (counters equal — under a profiler that erases the effect); P2, P3 **met**; the capacity pattern supports it |
 | [FA14](#fa14--the-backward-split-by-product-half-the-threads-on-each-of-the-two-products) | 2026-10-05 | does splitting each paired product across thread halves cut the backward's shared loads, bit for bit? | **all met**: backward −6.9 % (low end), shared loads −20.9 %, bitwise identical — **kept** |
 | [FA15](#fa15--the-backward-skips-its-dead-tail-work) | 2026-10-05 | does skipping the all-padding key groups, query rows and keys of the tail tiles speed the backward, bit for bit? | P1, P2, P4 **met**; P3 **missed** (+14.2 %, slower) — **rejected, reverted** |
+| [FA16](#fa16--the-dv-half-stops-waiting-for-ds) | 2026-10-05 | does letting the dV half start as soon as P is written (a 128-thread barrier for the dK half) give back FA14's barrier cost, bit for bit? | registered |
 
 ---
 
@@ -940,3 +941,50 @@ fixed trip counts that are themselves compile-time (a template on the overhang c
 compiler can unroll both. At S = 240 that path would run on 11 of 32 block-tiles; the gain is
 bounded by the 12.1 % of the multiply-adds it skips, minus the code-size and register cost of a
 second copy of each phase — a few percent at best, against a doubled kernel body.
+
+---
+
+## FA16 — the dV half stops waiting for dS
+
+*Registered 2026-10-05, before any code. Why: FA14 bought −20.9 % shared loads with one more
+block-wide barrier per query tile, and its barrier stall rose 0.38 → 0.67 warp-cycles per issued
+instruction; the backward gained only −6.9 %. Part of that barrier is waiting nobody needs.*
+
+**Today (FA14), per query tile:** barrier (tile landed) → phase 1 (both halves) → half 0 writes P →
+**barrier** → half 1 reads P, writes dS → **barrier** → phase 2 (half 0: dV from P, dO; half 1: dK
+from dS, Q) → phase 3 (all: dQ partial from dS, K) → the dQ turn (its own barriers).
+
+**The waste.** At the barrier after dS, half 0 (the dV owners) waits for half 1 to write dS, but dV
+never reads dS: it needs only P (written before the previous barrier) and dO.
+
+**Change** (`fattn_bwd_f32_d64` only). After the barrier that publishes P:
+- half 0 goes straight to its phase 2 (dV);
+- half 1 writes dS, syncs **among its own 4 warps** (`bar.sync 1, 128`: a named barrier, id 1 —
+  `__syncthreads` is id 0), then accumulates dK;
+- one block-wide barrier before phase 3 (which reads all of dS), where today's barrier after dS was.
+
+Same number of block-wide barriers; half 0's dV now overlaps half 1's dS. Hazards checked: phase 2
+writes only registers; the next tile's P and dS are written after the next tile's first barrier, so
+nobody can still be reading this tile's. `bar.sync` with a thread count orders shared memory among
+its participants, and exists on every target the crate builds (the fallback included).
+
+**Why the bits cannot move.** No arithmetic changes, nor which thread computes what; only when a
+warp waits. **The bitwise gate applies.**
+
+**Predictions.**
+- **P1 (gate):** O, dQ, dK, dV bitwise identical to FA14 (`55aea18`, the code since `c430372`) on
+  `bench/bitwise.py`'s 6 shapes, both entry points, native and forced-fallback builds.
+- **P2:** barrier stall below FA14's 0.67, between 0.45 and 0.62; instructions within ±1 %;
+  registers 128 ± 16; shared memory unchanged (Nsight Compute; cycles compared, not durations).
+- **P3:** backward kernel time **−1 to −4 %** against FA14, alternated (`bench/ab.py`, `train`, 6
+  rounds). Bounded by the barrier cost FA14 added (+0.29 of ~4 warp-cycles per issue, ~7 %), of
+  which only the dS wait is removed.
+- **P4:** the forward's PTX byte-identical.
+
+**Decision rule (fixed now).** P1 is a gate. Faster by ≥ 2 % with separated rounds: kept. 1–2 %:
+`ab.py` rerun with 10 rounds, kept if still separated. Otherwise reverted (`MEASURED-REVERT`), named
+in the kernel header. After FA16, whatever it gives: the rental round (A100, 4090, 5090: FA14 and
+FA16 confirmed there, `gemm_autotune` alongside), before any larger redesign is chosen.
+
+**Where / cost.** Local RTX 5060 Ti: 4 bitwise dumps (~15 s each), `ab.py` 6 rounds (~2 min), `ncu`
+(seconds); builds ~10 s each.
