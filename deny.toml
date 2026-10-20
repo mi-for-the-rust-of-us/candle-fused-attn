@@ -21,6 +21,13 @@ ignore = [
     # `paste` is archived upstream; it reaches us only as a build-time macro
     # dependency of candle's `gemm`, with no replacement until candle moves.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained, transitive via candle-core -> gemm; no upgrade available" },
+    # `zip` 8.6.0, pinned `^8.6.0` by candle-core 0.11 (the fix is 9.0, out of
+    # reach until candle moves). All three are in `extract()`, which neither
+    # candle (it reads `.npz`/`.pth` entries by name, writes `.npz`) nor this
+    # crate calls. Drop these when candle-core takes zip 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract() keeps SUID/SGID bits; never called, transitive via candle-core; no upgrade available" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract() symlink escape; never called, transitive via candle-core; no upgrade available" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract() permissions through symlinks; never called, transitive via candle-core; no upgrade available" },
 ]
 
 [licenses]
