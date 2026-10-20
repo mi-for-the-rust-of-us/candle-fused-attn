@@ -64,6 +64,12 @@ computes dK, dV and a dQ partial in one pass, the dQ partials added in key-block
   step (~0.3–0.5 %, estimated from FA14's −2.4 % on the attention call) is below what one trainer
   A/B resolves, so it was not measured. The next release's rental re-runs the canvas trainer
   against its PyTorch reference (askesis `torch_vs_candle.sh`, as FA12 did) and updates both.
+- **When candle-core takes `zip` 9: drop the three `zip` exceptions in `deny.toml`.**
+  RUSTSEC-2026-0367/0368/0369 (2026-10-19) are in `zip` 8.6.0's `extract()`, which neither candle
+  nor this crate calls; candle-core 0.11 pins `^8.6.0` and the fix is 9.0. An ignore that is no
+  longer needed only gets a warning (`advisory-not-detected`), which does not fail the job, so this
+  line is the reminder: at each candle-core bump,
+  `cargo tree -i zip`, and if it shows 9.x, delete the three entries and rerun `cargo deny check`.
 
 ## Later (speculative)
 
